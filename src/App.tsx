@@ -45,7 +45,17 @@ import {
   reloadUserSession,
   handleFirestoreError,
   OperationType,
+  subscribeUnifiedAuthState,
 } from './firebase';
+import {
+  WorkspaceSnapshot,
+  buildStarterWorkspaceSnapshot,
+  loadLocalWorkspaceSnapshot,
+  saveLocalWorkspaceSnapshot,
+  fetchServerWorkspaceSnapshot,
+  pushServerWorkspaceSnapshot,
+  sanitizeFirestorePayload,
+} from './services/accountPersistenceService';
 import {
   Workspace,
   UserPrivateProfile,
@@ -200,56 +210,166 @@ export default function App() {
   const [tasks, setTasks] = useState<TaskItem[]>(DEMO_TASKS);
   const [activities, setActivities] = useState<ActivityLog[]>(DEMO_ACTIVITIES);
 
-  // 1. Listen to Firebase Authentication State
+  // Helper to apply a loaded WorkspaceSnapshot into React state
+  const applyWorkspaceSnapshot = (snap: WorkspaceSnapshot, uid: string) => {
+    if (snap.workspace) setWorkspace({ ...snap.workspace, id: uid, ownerId: uid });
+    if (snap.privateProfile) {
+      const prof: UserPrivateProfile = {
+        ...snap.privateProfile,
+        id: 'default',
+        ownerId: uid,
+      };
+      setPrivateProfile(prof);
+      hydrateGatewayConfigFromPrivateProfile(prof, uid);
+    }
+    if (Array.isArray(snap.members)) setMembers(snap.members);
+    if (Array.isArray(snap.contacts)) setContacts(snap.contacts);
+    if (Array.isArray(snap.lists)) setLists(snap.lists);
+    if (Array.isArray(snap.automations)) setAutomations(snap.automations);
+    if (Array.isArray(snap.autoResponders)) setAutoResponders(snap.autoResponders);
+    if (Array.isArray(snap.inboxThreads)) setInboxThreads(snap.inboxThreads);
+    if (Array.isArray(snap.campaigns)) setCampaigns(snap.campaigns);
+    if (Array.isArray(snap.assets)) setAssets(snap.assets);
+    if (Array.isArray(snap.chatbots)) setChatbots(snap.chatbots);
+    if (Array.isArray(snap.tasks)) setTasks(snap.tasks);
+    if (Array.isArray(snap.activities)) setActivities(snap.activities);
+  };
+
+  // 1. Listen to Unified Authentication State (Firebase Auth + Persistent Server/Local Vault)
   useEffect(() => {
-    const unsubscribe = onAuthStateChanged(auth, async (user) => {
+    const unsubscribe = subscribeUnifiedAuthState(async (user, session) => {
       setActiveGatewayAccountUid(user ? user.uid : null);
-      if (user && user.emailVerified) {
+      if (user) {
         setIsAuthReady(false);
-        const wsRef = doc(db, 'workspaces', user.uid);
-        try {
-          const snap = await getDoc(wsRef);
-          if (!snap.exists()) {
-            await seedStarterWorkspaceInFirestore(
-              user.uid,
-              user.email || 'operator@flowpilot.app',
-              user.displayName || 'FlowPilot Operator'
-            );
+        const uid = user.uid;
+        const email = user.email || session?.email || 'operator@flowpilot.app';
+        const displayName =
+          user.displayName ||
+          session?.displayName ||
+          email.split('@')[0] ||
+          'Workspace Owner';
+        const wsName = session?.workspaceName || `${displayName}'s Workspace`;
+
+        // 1. Immediately hydrate from Local or Server Account Snapshot (or starter workspace)
+        const localSnap = loadLocalWorkspaceSnapshot(uid, email);
+        if (localSnap) {
+          applyWorkspaceSnapshot(localSnap, uid);
+        } else {
+          const serverSnap = await fetchServerWorkspaceSnapshot(uid, email);
+          if (serverSnap) {
+            applyWorkspaceSnapshot(serverSnap, uid);
+            saveLocalWorkspaceSnapshot(uid, email, serverSnap);
           } else {
-            await purgeLegacyDemoDataFromFirestore(user.uid);
+            const starterSnap = buildStarterWorkspaceSnapshot(
+              uid,
+              email,
+              displayName,
+              wsName
+            );
+            applyWorkspaceSnapshot(starterSnap, uid);
+            saveLocalWorkspaceSnapshot(uid, email, starterSnap);
+            void pushServerWorkspaceSnapshot(uid, email, starterSnap);
           }
-        } catch (error) {
-          handleFirestoreError(error, OperationType.GET, `workspaces/${user.uid}`);
         }
+
+        // 2. If backed by a live Firebase Auth user, also seed/sync Cloud Firestore
+        if (auth.currentUser && auth.currentUser.uid === uid) {
+          const wsRef = doc(db, 'workspaces', uid);
+          try {
+            const snap = await getDoc(wsRef);
+            if (!snap.exists()) {
+              await seedStarterWorkspaceInFirestore(uid, email, displayName, wsName);
+            } else {
+              await purgeLegacyDemoDataFromFirestore(uid);
+            }
+          } catch (error) {
+            handleFirestoreError(error, OperationType.GET, `workspaces/${uid}`);
+          }
+        }
+
         setCurrentUser(user);
         setViewMode('workspace');
         setIsAuthReady(true);
       } else {
-        setCurrentUser(user);
-        setWorkspace(DEMO_WORKSPACE);
-        setPrivateProfile(DEMO_PRIVATE_PROFILE);
-        setMembers(DEMO_MEMBERS);
-        setContacts(DEMO_CONTACTS);
-        setLists(DEMO_LISTS);
-        setAutomations(DEMO_AUTOMATIONS);
-        setAutoResponders(DEMO_AUTORESPONDERS);
-        setInboxThreads(DEMO_INBOX_THREADS);
-        setCampaigns(DEMO_CAMPAIGNS);
-        setAssets(DEMO_ASSETS);
-        setChatbots(DEMO_CHATBOTS);
-        setTasks(DEMO_TASKS);
-        setActivities(DEMO_ACTIVITIES);
+        setCurrentUser(null);
+        const guestSnap = loadLocalWorkspaceSnapshot('guest_sandbox', 'guest@flowpilot.app');
+        if (guestSnap) {
+          applyWorkspaceSnapshot(guestSnap, guestSnap.workspace.id || 'ws_default');
+        } else {
+          setWorkspace(DEMO_WORKSPACE);
+          setPrivateProfile(DEMO_PRIVATE_PROFILE);
+          setMembers(DEMO_MEMBERS);
+          setContacts(DEMO_CONTACTS);
+          setLists(DEMO_LISTS);
+          setAutomations(DEMO_AUTOMATIONS);
+          setAutoResponders(DEMO_AUTORESPONDERS);
+          setInboxThreads(DEMO_INBOX_THREADS);
+          setCampaigns(DEMO_CAMPAIGNS);
+          setAssets(DEMO_ASSETS);
+          setChatbots(DEMO_CHATBOTS);
+          setTasks(DEMO_TASKS);
+          setActivities(DEMO_ACTIVITIES);
+        }
         setIsAuthReady(true);
       }
     });
     return () => unsubscribe();
   }, []);
 
-  // 2. Attach Real-Time Firestore Listeners when Authenticated & Verified
+  // 1B. Dual-Sync Persistence Effect: Mirror every state mutation to Local & Server Account Storage
   useEffect(() => {
-    if (!isAuthReady || !currentUser || !currentUser.emailVerified) return;
+    if (!isAuthReady) return;
+    const uid = currentUser?.uid || 'guest_sandbox';
+    const email = currentUser?.email || privateProfile.email || 'guest@flowpilot.app';
 
-    const uid = currentUser.uid;
+    const snapshot: WorkspaceSnapshot = {
+      workspace,
+      privateProfile,
+      members,
+      contacts,
+      lists,
+      automations,
+      autoResponders,
+      inboxThreads,
+      campaigns,
+      assets,
+      chatbots,
+      tasks,
+      activities,
+      updatedAt: new Date().toISOString(),
+    };
+
+    saveLocalWorkspaceSnapshot(uid, email, snapshot);
+
+    if (currentUser) {
+      const timer = setTimeout(() => {
+        void pushServerWorkspaceSnapshot(uid, email, snapshot);
+      }, 300);
+      return () => clearTimeout(timer);
+    }
+  }, [
+    isAuthReady,
+    currentUser,
+    workspace,
+    privateProfile,
+    members,
+    contacts,
+    lists,
+    automations,
+    autoResponders,
+    inboxThreads,
+    campaigns,
+    assets,
+    chatbots,
+    tasks,
+    activities,
+  ]);
+
+  // 2. Attach Real-Time Firestore Listeners when Authenticated with Firebase
+  useEffect(() => {
+    if (!isAuthReady || !currentUser || !auth.currentUser) return;
+
+    const uid = auth.currentUser.uid;
     const unsubs: (() => void)[] = [];
 
     // Workspace listener
@@ -288,11 +408,13 @@ export default function App() {
       onSnapshot(
         query(collection(db, 'workspaces', uid, 'members'), where('ownerId', '==', uid)),
         (snap) => {
-          const list = snap.docs.map((d) => ({
-            id: d.id,
-            ...(d.data() as Omit<WorkspaceMember, 'id'>),
-          }));
-          setMembers(list);
+          if (snap.docs.length > 0) {
+            const list = snap.docs.map((d) => ({
+              id: d.id,
+              ...(d.data() as Omit<WorkspaceMember, 'id'>),
+            }));
+            setMembers(list);
+          }
         },
         (err) => handleFirestoreError(err, OperationType.LIST, `workspaces/${uid}/members`)
       )
@@ -303,11 +425,13 @@ export default function App() {
       onSnapshot(
         query(collection(db, 'contacts'), where('ownerId', '==', uid)),
         (snap) => {
-          const list = snap.docs.map((d) => ({
-            id: d.id,
-            ...(d.data() as Omit<Contact, 'id'>),
-          }));
-          setContacts(list);
+          if (snap.docs.length > 0) {
+            const list = snap.docs.map((d) => ({
+              id: d.id,
+              ...(d.data() as Omit<Contact, 'id'>),
+            }));
+            setContacts(list);
+          }
         },
         (err) => handleFirestoreError(err, OperationType.LIST, 'contacts')
       )
@@ -318,11 +442,13 @@ export default function App() {
       onSnapshot(
         query(collection(db, 'lists'), where('ownerId', '==', uid)),
         (snap) => {
-          const list = snap.docs.map((d) => ({
-            id: d.id,
-            ...(d.data() as Omit<AudienceList, 'id'>),
-          }));
-          setLists(list);
+          if (snap.docs.length > 0) {
+            const list = snap.docs.map((d) => ({
+              id: d.id,
+              ...(d.data() as Omit<AudienceList, 'id'>),
+            }));
+            setLists(list);
+          }
         },
         (err) => handleFirestoreError(err, OperationType.LIST, 'lists')
       )
@@ -333,11 +459,13 @@ export default function App() {
       onSnapshot(
         query(collection(db, 'automations'), where('ownerId', '==', uid)),
         (snap) => {
-          const list = snap.docs.map((d) => ({
-            id: d.id,
-            ...(d.data() as Omit<Automation, 'id'>),
-          }));
-          setAutomations(list);
+          if (snap.docs.length > 0) {
+            const list = snap.docs.map((d) => ({
+              id: d.id,
+              ...(d.data() as Omit<Automation, 'id'>),
+            }));
+            setAutomations(list);
+          }
         },
         (err) => handleFirestoreError(err, OperationType.LIST, 'automations')
       )
@@ -348,11 +476,13 @@ export default function App() {
       onSnapshot(
         query(collection(db, 'campaigns'), where('ownerId', '==', uid)),
         (snap) => {
-          const list = snap.docs.map((d) => ({
-            id: d.id,
-            ...(d.data() as Omit<Campaign, 'id'>),
-          }));
-          setCampaigns(list);
+          if (snap.docs.length > 0) {
+            const list = snap.docs.map((d) => ({
+              id: d.id,
+              ...(d.data() as Omit<Campaign, 'id'>),
+            }));
+            setCampaigns(list);
+          }
         },
         (err) => handleFirestoreError(err, OperationType.LIST, 'campaigns')
       )
@@ -363,11 +493,13 @@ export default function App() {
       onSnapshot(
         query(collection(db, 'assets'), where('ownerId', '==', uid)),
         (snap) => {
-          const list = snap.docs.map((d) => ({
-            id: d.id,
-            ...(d.data() as Omit<CaptureAsset, 'id'>),
-          }));
-          setAssets(list);
+          if (snap.docs.length > 0) {
+            const list = snap.docs.map((d) => ({
+              id: d.id,
+              ...(d.data() as Omit<CaptureAsset, 'id'>),
+            }));
+            setAssets(list);
+          }
         },
         (err) => handleFirestoreError(err, OperationType.LIST, 'assets')
       )
@@ -378,11 +510,13 @@ export default function App() {
       onSnapshot(
         query(collection(db, 'chatbots'), where('ownerId', '==', uid)),
         (snap) => {
-          const list = snap.docs.map((d) => ({
-            id: d.id,
-            ...(d.data() as Omit<ChatbotFlow, 'id'>),
-          }));
-          setChatbots(list);
+          if (snap.docs.length > 0) {
+            const list = snap.docs.map((d) => ({
+              id: d.id,
+              ...(d.data() as Omit<ChatbotFlow, 'id'>),
+            }));
+            setChatbots(list);
+          }
         },
         (err) => handleFirestoreError(err, OperationType.LIST, 'chatbots')
       )
@@ -393,11 +527,13 @@ export default function App() {
       onSnapshot(
         query(collection(db, 'autoresponders'), where('ownerId', '==', uid)),
         (snap) => {
-          const list = snap.docs.map((d) => ({
-            id: d.id,
-            ...(d.data() as Omit<AutoResponder, 'id'>),
-          }));
-          setAutoResponders(list);
+          if (snap.docs.length > 0) {
+            const list = snap.docs.map((d) => ({
+              id: d.id,
+              ...(d.data() as Omit<AutoResponder, 'id'>),
+            }));
+            setAutoResponders(list);
+          }
         },
         (err) => handleFirestoreError(err, OperationType.LIST, 'autoresponders')
       )
@@ -408,11 +544,13 @@ export default function App() {
       onSnapshot(
         query(collection(db, 'inbox_threads'), where('ownerId', '==', uid)),
         (snap) => {
-          const list = snap.docs.map((d) => ({
-            id: d.id,
-            ...(d.data() as Omit<InboxThread, 'id'>),
-          }));
-          setInboxThreads(list);
+          if (snap.docs.length > 0) {
+            const list = snap.docs.map((d) => ({
+              id: d.id,
+              ...(d.data() as Omit<InboxThread, 'id'>),
+            }));
+            setInboxThreads(list);
+          }
         },
         (err) => handleFirestoreError(err, OperationType.LIST, 'inbox_threads')
       )
@@ -423,11 +561,13 @@ export default function App() {
       onSnapshot(
         query(collection(db, 'tasks'), where('ownerId', '==', uid)),
         (snap) => {
-          const list = snap.docs.map((d) => ({
-            id: d.id,
-            ...(d.data() as Omit<TaskItem, 'id'>),
-          }));
-          setTasks(list);
+          if (snap.docs.length > 0) {
+            const list = snap.docs.map((d) => ({
+              id: d.id,
+              ...(d.data() as Omit<TaskItem, 'id'>),
+            }));
+            setTasks(list);
+          }
         },
         (err) => handleFirestoreError(err, OperationType.LIST, 'tasks')
       )
@@ -438,11 +578,13 @@ export default function App() {
       onSnapshot(
         query(collection(db, 'activities'), where('ownerId', '==', uid)),
         (snap) => {
-          const list = snap.docs.map((d) => ({
-            id: d.id,
-            ...(d.data() as Omit<ActivityLog, 'id'>),
-          }));
-          setActivities(list);
+          if (snap.docs.length > 0) {
+            const list = snap.docs.map((d) => ({
+              id: d.id,
+              ...(d.data() as Omit<ActivityLog, 'id'>),
+            }));
+            setActivities(list);
+          }
         },
         (err) => handleFirestoreError(err, OperationType.LIST, 'activities')
       )
@@ -453,7 +595,7 @@ export default function App() {
     };
   }, [isAuthReady, currentUser]);
 
-  const isCloudAuthenticated = Boolean(currentUser && currentUser.emailVerified);
+  const isCloudAuthenticated = Boolean(currentUser && auth.currentUser);
   const isSignedInAny = Boolean(currentUser);
 
   const handleOpenAuthModal = (mode: AuthModalMode = 'signin') => {
@@ -493,71 +635,85 @@ export default function App() {
     channel: ActivityLog['channel']
   ) => {
     const actId = generateSafeId('act');
-    if (isCloudAuthenticated && currentUser) {
-      const uid = currentUser.uid;
+    const ownerUid = currentUser?.uid || workspace.ownerId;
+    setActivities((prev) => [
+      {
+        id: actId,
+        workspaceId: ownerUid,
+        ownerId: ownerUid,
+        eventType,
+        title: title.slice(0, 160),
+        detail: detail.slice(0, 280),
+        channel,
+        createdAt: new Date().toISOString(),
+      },
+      ...prev,
+    ]);
+
+    if (isCloudAuthenticated && auth.currentUser) {
+      const uid = auth.currentUser.uid;
       try {
-        await setDoc(doc(db, 'activities', actId), {
-          workspaceId: uid,
-          ownerId: uid,
-          eventType,
-          title: title.slice(0, 160),
-          detail: detail.slice(0, 280),
-          channel,
-          createdAt: serverTimestamp(),
-          updatedAt: serverTimestamp(),
-        });
+        await setDoc(
+          doc(db, 'activities', actId),
+          sanitizeFirestorePayload({
+            workspaceId: uid,
+            ownerId: uid,
+            eventType,
+            title: title.slice(0, 160),
+            detail: detail.slice(0, 280),
+            channel,
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          })
+        );
       } catch (error) {
         handleFirestoreError(error, OperationType.CREATE, `activities/${actId}`);
       }
-    } else {
-      setActivities((prev) => [
-        {
-          id: actId,
-          workspaceId: workspace.id,
-          ownerId: workspace.ownerId,
-          eventType,
-          title: title.slice(0, 160),
-          detail: detail.slice(0, 280),
-          channel,
-          createdAt: new Date().toISOString(),
-        },
-        ...prev,
-      ]);
     }
   };
 
   // =========================================================================
-  // CRUD HANDLERS (Cloud Firestore + Interactive Sandbox Fallback)
+  // CRUD HANDLERS (Dual-Sync: Instant Local/Server State + Cloud Firestore)
   // =========================================================================
 
   const handleCreateContact = async (
     data: Omit<Contact, 'id' | 'workspaceId' | 'ownerId' | 'createdAt' | 'updatedAt'>
   ) => {
     const cid = generateSafeId('cnt');
-    if (isCloudAuthenticated && currentUser) {
-      const uid = currentUser.uid;
+    const ownerUid = currentUser?.uid || workspace.ownerId;
+    const newContact: Contact = {
+      id: cid,
+      workspaceId: ownerUid,
+      ownerId: ownerUid,
+      ...data,
+      createdAt: new Date().toISOString(),
+    };
+    setContacts((prev) => [newContact, ...prev]);
+
+    if (isCloudAuthenticated && auth.currentUser) {
+      const uid = auth.currentUser.uid;
       try {
-        await setDoc(doc(db, 'contacts', cid), {
-          workspaceId: uid,
-          ownerId: uid,
-          ...data,
-          createdAt: serverTimestamp(),
-          updatedAt: serverTimestamp(),
-        });
+        await setDoc(
+          doc(db, 'contacts', cid),
+          sanitizeFirestorePayload({
+            workspaceId: uid,
+            ownerId: uid,
+            ...data,
+            fullName: (data.fullName || 'Contact').slice(0, 100),
+            email: (data.email || '').slice(0, 150),
+            phone: (data.phone || '').slice(0, 32),
+            source: (data.source || 'Manual Entry').slice(0, 80),
+            listName: (data.listName || 'General Contacts').slice(0, 80),
+            tags: (data.tags || []).slice(0, 10),
+            ltv: Math.max(0, Number(data.ltv) || 0),
+            notes: (data.notes || '').slice(0, 500),
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          })
+        );
       } catch (error) {
         handleFirestoreError(error, OperationType.CREATE, `contacts/${cid}`);
       }
-    } else {
-      setContacts((prev) => [
-        {
-          id: cid,
-          workspaceId: workspace.id,
-          ownerId: workspace.ownerId,
-          ...data,
-          createdAt: new Date().toISOString(),
-        },
-        ...prev,
-      ]);
     }
 
     await logActivityEvent(
@@ -599,19 +755,30 @@ export default function App() {
     id: string,
     data: Omit<Contact, 'id' | 'workspaceId' | 'ownerId' | 'createdAt' | 'updatedAt'>
   ) => {
-    if (isCloudAuthenticated && currentUser) {
+    setContacts((prev) =>
+      prev.map((c) => (c.id === id ? { ...c, ...data } : c))
+    );
+
+    if (isCloudAuthenticated && auth.currentUser) {
       try {
-        await updateDoc(doc(db, 'contacts', id), {
-          ...data,
-          updatedAt: serverTimestamp(),
-        });
+        await updateDoc(
+          doc(db, 'contacts', id),
+          sanitizeFirestorePayload({
+            ...data,
+            fullName: (data.fullName || 'Contact').slice(0, 100),
+            email: (data.email || '').slice(0, 150),
+            phone: (data.phone || '').slice(0, 32),
+            source: (data.source || 'Manual Entry').slice(0, 80),
+            listName: (data.listName || 'General Contacts').slice(0, 80),
+            tags: (data.tags || []).slice(0, 10),
+            ltv: Math.max(0, Number(data.ltv) || 0),
+            notes: (data.notes || '').slice(0, 500),
+            updatedAt: serverTimestamp(),
+          })
+        );
       } catch (error) {
         handleFirestoreError(error, OperationType.UPDATE, `contacts/${id}`);
       }
-    } else {
-      setContacts((prev) =>
-        prev.map((c) => (c.id === id ? { ...c, ...data } : c))
-      );
     }
 
     await logActivityEvent(
@@ -621,9 +788,6 @@ export default function App() {
       'crm'
     );
 
-    // Sync contact tags & List Kill Switch rules with the Server Background Scheduler
-    // so if a Kill Switch tag (e.g., #Purchased_Course) was just added to this contact,
-    // any pending delayed automation steps on the server are immediately halted for this contact.
     void syncKillSwitchWithServerScheduler({
       contacts: [
         {
@@ -647,14 +811,13 @@ export default function App() {
   };
 
   const handleDeleteContact = async (id: string) => {
-    if (isCloudAuthenticated && currentUser) {
+    setContacts((prev) => prev.filter((c) => c.id !== id));
+    if (isCloudAuthenticated && auth.currentUser) {
       try {
         await deleteDoc(doc(db, 'contacts', id));
       } catch (error) {
         handleFirestoreError(error, OperationType.DELETE, `contacts/${id}`);
       }
-    } else {
-      setContacts((prev) => prev.filter((c) => c.id !== id));
     }
   };
 
@@ -662,43 +825,48 @@ export default function App() {
     data: Omit<AudienceList, 'id' | 'workspaceId' | 'ownerId' | 'createdAt' | 'updatedAt'>
   ) => {
     const lid = generateSafeId('lst');
+    const ownerUid = currentUser?.uid || workspace.ownerId;
     const resolvedKillTags = (
       data.killSwitchTags && data.killSwitchTags.length > 0
         ? data.killSwitchTags
         : ['Purchased_Course']
     ).slice(0, 10);
-    if (isCloudAuthenticated && currentUser) {
-      const uid = currentUser.uid;
+
+    setLists((prev) => [
+      {
+        id: lid,
+        workspaceId: ownerUid,
+        ownerId: ownerUid,
+        ...data,
+        killSwitchEnabled: data.killSwitchEnabled !== false,
+        killSwitchTags: resolvedKillTags,
+      },
+      ...prev,
+    ]);
+
+    if (isCloudAuthenticated && auth.currentUser) {
+      const uid = auth.currentUser.uid;
       try {
-        await setDoc(doc(db, 'lists', lid), {
-          workspaceId: uid,
-          ownerId: uid,
-          name: data.name.slice(0, 100),
-          description: data.description.slice(0, 300),
-          category: data.category,
-          defaultConsent: data.defaultConsent,
-          defaultTags: (data.defaultTags || []).slice(0, 10),
-          colorAccent: data.colorAccent,
-          killSwitchEnabled: data.killSwitchEnabled !== false,
-          killSwitchTags: resolvedKillTags,
-          createdAt: serverTimestamp(),
-          updatedAt: serverTimestamp(),
-        });
+        await setDoc(
+          doc(db, 'lists', lid),
+          sanitizeFirestorePayload({
+            workspaceId: uid,
+            ownerId: uid,
+            name: data.name.slice(0, 100),
+            description: data.description.slice(0, 300),
+            category: data.category,
+            defaultConsent: data.defaultConsent,
+            defaultTags: (data.defaultTags || []).slice(0, 10),
+            colorAccent: data.colorAccent,
+            killSwitchEnabled: data.killSwitchEnabled !== false,
+            killSwitchTags: resolvedKillTags,
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          })
+        );
       } catch (error) {
         handleFirestoreError(error, OperationType.CREATE, `lists/${lid}`);
       }
-    } else {
-      setLists((prev) => [
-        {
-          id: lid,
-          workspaceId: workspace.id,
-          ownerId: workspace.ownerId,
-          ...data,
-          killSwitchEnabled: data.killSwitchEnabled !== false,
-          killSwitchTags: resolvedKillTags,
-        },
-        ...prev,
-      ]);
     }
 
     void syncKillSwitchWithServerScheduler({
@@ -728,26 +896,39 @@ export default function App() {
         ? data.killSwitchTags
         : ['Purchased_Course']
     ).slice(0, 10);
-    if (isCloudAuthenticated && currentUser) {
+
+    setLists((prev) =>
+      prev.map((l) =>
+        l.id === id
+          ? {
+              ...l,
+              ...data,
+              killSwitchEnabled: data.killSwitchEnabled !== false,
+              killSwitchTags: resolvedKillTags,
+            }
+          : l
+      )
+    );
+
+    if (isCloudAuthenticated && auth.currentUser) {
       try {
-        await updateDoc(doc(db, 'lists', id), {
-          name: data.name.slice(0, 100),
-          description: data.description.slice(0, 300),
-          category: data.category,
-          defaultConsent: data.defaultConsent,
-          defaultTags: (data.defaultTags || []).slice(0, 10),
-          colorAccent: data.colorAccent,
-          killSwitchEnabled: data.killSwitchEnabled !== false,
-          killSwitchTags: resolvedKillTags,
-          updatedAt: serverTimestamp(),
-        });
+        await updateDoc(
+          doc(db, 'lists', id),
+          sanitizeFirestorePayload({
+            name: data.name.slice(0, 100),
+            description: data.description.slice(0, 300),
+            category: data.category,
+            defaultConsent: data.defaultConsent,
+            defaultTags: (data.defaultTags || []).slice(0, 10),
+            colorAccent: data.colorAccent,
+            killSwitchEnabled: data.killSwitchEnabled !== false,
+            killSwitchTags: resolvedKillTags,
+            updatedAt: serverTimestamp(),
+          })
+        );
       } catch (error) {
         handleFirestoreError(error, OperationType.UPDATE, `lists/${id}`);
       }
-    } else {
-      setLists((prev) =>
-        prev.map((l) => (l.id === id ? { ...l, ...data } : l))
-      );
     }
 
     void syncKillSwitchWithServerScheduler({
@@ -762,14 +943,13 @@ export default function App() {
   };
 
   const handleDeleteList = async (id: string) => {
-    if (isCloudAuthenticated && currentUser) {
+    setLists((prev) => prev.filter((l) => l.id !== id));
+    if (isCloudAuthenticated && auth.currentUser) {
       try {
         await deleteDoc(doc(db, 'lists', id));
       } catch (error) {
         handleFirestoreError(error, OperationType.DELETE, `lists/${id}`);
       }
-    } else {
-      setLists((prev) => prev.filter((l) => l.id !== id));
     }
   };
 
@@ -881,45 +1061,49 @@ export default function App() {
         .filter(Boolean)
         .slice(0, 10);
 
-      if (isCloudAuthenticated && currentUser) {
-        const uid = currentUser.uid;
+      const ownerUid = currentUser?.uid || workspace.ownerId;
+      setContacts((prev) => [
+        {
+          id: cid,
+          workspaceId: ownerUid,
+          ownerId: ownerUid,
+          ...data,
+          tags: finalNewTags,
+          createdAt: new Date().toISOString(),
+        },
+        ...prev,
+      ]);
+
+      if (isCloudAuthenticated && auth.currentUser) {
+        const uid = auth.currentUser.uid;
         try {
-          await setDoc(doc(db, 'contacts', cid), {
-            workspaceId: uid,
-            ownerId: uid,
-            fullName: data.fullName.slice(0, 100),
-            email: data.email.slice(0, 150),
-            phone: (data.phone || '').slice(0, 32),
-            company: (data.company || '').slice(0, 100),
-            dealTitle: (data.dealTitle || '').slice(0, 120),
-            stage: data.stage,
-            temperature: data.temperature,
-            source: (data.source || 'CSV Import').slice(0, 80),
-            consentStatus: data.consentStatus,
-            commChannels: (data.commChannels || ['email']).slice(0, 5),
-            listName: (data.listName || 'Imported Contacts').slice(0, 80),
-            tags: finalNewTags,
-            ltv: Math.max(0, Number(data.ltv) || 0),
-            notes: (data.notes || '').slice(0, 500),
-            customFields: (data.customFields || []).slice(0, 15),
-            createdAt: serverTimestamp(),
-            updatedAt: serverTimestamp(),
-          });
+          await setDoc(
+            doc(db, 'contacts', cid),
+            sanitizeFirestorePayload({
+              workspaceId: uid,
+              ownerId: uid,
+              fullName: data.fullName.slice(0, 100),
+              email: data.email.slice(0, 150),
+              phone: (data.phone || '').slice(0, 32),
+              company: (data.company || '').slice(0, 100),
+              dealTitle: (data.dealTitle || '').slice(0, 120),
+              stage: data.stage,
+              temperature: data.temperature,
+              source: (data.source || 'CSV Import').slice(0, 80),
+              consentStatus: data.consentStatus,
+              commChannels: (data.commChannels || ['email']).slice(0, 5),
+              listName: (data.listName || 'Imported Contacts').slice(0, 80),
+              tags: finalNewTags,
+              ltv: Math.max(0, Number(data.ltv) || 0),
+              notes: (data.notes || '').slice(0, 500),
+              customFields: (data.customFields || []).slice(0, 15),
+              createdAt: serverTimestamp(),
+              updatedAt: serverTimestamp(),
+            })
+          );
         } catch (error) {
           handleFirestoreError(error, OperationType.CREATE, `contacts/${cid}`);
         }
-      } else {
-        setContacts((prev) => [
-          {
-            id: cid,
-            workspaceId: workspace.id,
-            ownerId: workspace.ownerId,
-            ...data,
-            tags: finalNewTags,
-            createdAt: new Date().toISOString(),
-          },
-          ...prev,
-        ]);
       }
 
       createdCount += 1;
@@ -1069,29 +1253,33 @@ export default function App() {
     data: Omit<Automation, 'id' | 'workspaceId' | 'ownerId' | 'createdAt' | 'updatedAt'>
   ) => {
     const aid = generateSafeId('auto');
-    if (isCloudAuthenticated && currentUser) {
-      const uid = currentUser.uid;
+    const ownerUid = currentUser?.uid || workspace.ownerId;
+    setAutomations((prev) => [
+      {
+        id: aid,
+        workspaceId: ownerUid,
+        ownerId: ownerUid,
+        ...data,
+      },
+      ...prev,
+    ]);
+
+    if (isCloudAuthenticated && auth.currentUser) {
+      const uid = auth.currentUser.uid;
       try {
-        await setDoc(doc(db, 'automations', aid), {
-          workspaceId: uid,
-          ownerId: uid,
-          ...data,
-          createdAt: serverTimestamp(),
-          updatedAt: serverTimestamp(),
-        });
+        await setDoc(
+          doc(db, 'automations', aid),
+          sanitizeFirestorePayload({
+            workspaceId: uid,
+            ownerId: uid,
+            ...data,
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          })
+        );
       } catch (error) {
         handleFirestoreError(error, OperationType.CREATE, `automations/${aid}`);
       }
-    } else {
-      setAutomations((prev) => [
-        {
-          id: aid,
-          workspaceId: workspace.id,
-          ownerId: workspace.ownerId,
-          ...data,
-        },
-        ...prev,
-      ]);
     }
 
     await logActivityEvent(
@@ -1106,31 +1294,33 @@ export default function App() {
     id: string,
     data: Omit<Automation, 'id' | 'workspaceId' | 'ownerId' | 'createdAt' | 'updatedAt'>
   ) => {
-    if (isCloudAuthenticated && currentUser) {
+    setAutomations((prev) =>
+      prev.map((a) => (a.id === id ? { ...a, ...data } : a))
+    );
+
+    if (isCloudAuthenticated && auth.currentUser) {
       try {
-        await updateDoc(doc(db, 'automations', id), {
-          ...data,
-          updatedAt: serverTimestamp(),
-        });
+        await updateDoc(
+          doc(db, 'automations', id),
+          sanitizeFirestorePayload({
+            ...data,
+            updatedAt: serverTimestamp(),
+          })
+        );
       } catch (error) {
         handleFirestoreError(error, OperationType.UPDATE, `automations/${id}`);
       }
-    } else {
-      setAutomations((prev) =>
-        prev.map((a) => (a.id === id ? { ...a, ...data } : a))
-      );
     }
   };
 
   const handleDeleteAutomation = async (id: string) => {
-    if (isCloudAuthenticated && currentUser) {
+    setAutomations((prev) => prev.filter((a) => a.id !== id));
+    if (isCloudAuthenticated && auth.currentUser) {
       try {
         await deleteDoc(doc(db, 'automations', id));
       } catch (error) {
         handleFirestoreError(error, OperationType.DELETE, `automations/${id}`);
       }
-    } else {
-      setAutomations((prev) => prev.filter((a) => a.id !== id));
     }
   };
 
@@ -1170,11 +1360,8 @@ export default function App() {
     const leadList =
       targetContactOverride?.listName || resolvedList || fallbackContact?.listName || 'General Contacts';
 
-    // Parse full workflow graph and execute every active message node on the evaluated branch path
     const parsedGraph = parseOrBuildFlowGraph(auto);
 
-    // List Kill Switch Enforcement: If any tag on this contact matches the List's Kill Switch tags,
-    // immediately stop automation for this contact (while keeping the list automation active for other leads)
     const contactTags = targetContactOverride?.tags || fallbackContact?.tags || [];
     const contactStage = targetContactOverride?.stage || fallbackContact?.stage || 'lead';
     const killSwitchCheck = evaluateWorkflowKillSwitch(
@@ -1255,6 +1442,7 @@ export default function App() {
           company: leadCompany,
           listName: leadList,
           senderName: workspace.senderName || workspace.name,
+          automationId: auto.id,
         });
         const personalizedBody = personalizeAutomationMessage(rawBody, {
           fullName: leadName,
@@ -1263,10 +1451,9 @@ export default function App() {
           company: leadCompany,
           listName: leadList,
           senderName: workspace.senderName || workspace.name,
+          automationId: auto.id,
         });
 
-        // If this message step follows a Wait / Delay node, also enqueue it on the
-        // Server Background Scheduler with the target List's Kill Switch rules!
         if (cumulativeWaitSeconds > 0) {
           void enqueueScheduledAutomationJobs([
             {
@@ -1285,6 +1472,7 @@ export default function App() {
               listName: leadList,
               killSwitchEnabled: listKillSwitchEnabled,
               killSwitchTags: listKillSwitchTags,
+              fromIdentity: node.config.overrideFromIdentity || undefined,
               subject: personalizedSubject,
               body: personalizedBody,
               delaySeconds: Math.min(cumulativeWaitSeconds, 600),
@@ -1302,6 +1490,7 @@ export default function App() {
           body: personalizedBody,
           listName: leadList,
           source: 'automation_workflow',
+          overrideFromIdentity: node.config.overrideFromIdentity || undefined,
           workspace,
           privateProfile,
         });
@@ -1312,7 +1501,6 @@ export default function App() {
       }
     }
 
-    // Fallback if workflow had no explicit message nodes in graph
     if (dispatchedCount === 0) {
       const primaryChannel = ((auto.channels[0] || 'email').toLowerCase() as ChannelType);
       const validCh: ChannelType =
@@ -1326,6 +1514,7 @@ export default function App() {
           company: leadCompany,
           listName: leadList,
           senderName: workspace.senderName || workspace.name,
+          automationId: auto.id,
         }
       );
       await deliverChannelMessage({
@@ -1352,12 +1541,14 @@ export default function App() {
   };
 
   const executeLiveCampaignBroadcastDispatch = async (campData: {
+    id?: string;
     name: string;
     channel: ChannelType;
     targetList: string;
     subjectOrTemplate: string;
     messageBody: string;
     recipientCount: number;
+    overrideFromIdentity?: string;
   }) => {
     const rawTargetLeads = contacts.filter(
       (c) =>
@@ -1365,7 +1556,6 @@ export default function App() {
         c.listName.trim().toLowerCase() === campData.targetList.trim().toLowerCase()
     );
 
-    // Filter out any contact stopped by the target List's Kill Switch (e.g., #Purchased_Course)
     const eligibleLeads = rawTargetLeads.filter(
       (c) =>
         !evaluateListKillSwitchForContact(
@@ -1376,8 +1566,15 @@ export default function App() {
     );
     const haltedKillSwitchCount = rawTargetLeads.length - eligibleLeads.length;
 
+    const fallbackLead = contacts[0] || {
+      fullName: 'Broadcast Subscriber',
+      email: privateProfile.email || 'lead@example.com',
+      phone: privateProfile.whatsappBusinessNumber || privateProfile.phone || '+1 (555) 234-8910',
+      company: workspace.name,
+    };
+
     const dispatchTargets =
-      eligibleLeads.length > 0 ? eligibleLeads.slice(0, 5) : [contacts[0]].filter(Boolean);
+      eligibleLeads.length > 0 ? eligibleLeads.slice(0, 5) : [fallbackLead];
 
     let lastReceipt = null;
     for (const target of dispatchTargets) {
@@ -1390,6 +1587,7 @@ export default function App() {
           company: target?.company || 'Partner',
           listName: campData.targetList,
           senderName: workspace.senderName || workspace.name,
+          campaignId: campData.id,
         }
       );
       const personalizedBody = personalizeAutomationMessage(campData.messageBody, {
@@ -1399,26 +1597,31 @@ export default function App() {
         company: target?.company || 'Partner',
         listName: campData.targetList,
         senderName: workspace.senderName || workspace.name,
+        campaignId: campData.id,
       });
 
       lastReceipt = await deliverChannelMessage({
         channel: campData.channel,
         to:
           campData.channel === 'email'
-            ? target?.email || 'lead@example.com'
-            : target?.phone || '+1 (555) 234-8910',
+            ? target?.email || privateProfile.email || 'lead@example.com'
+            : target?.phone ||
+              privateProfile.whatsappBusinessNumber ||
+              privateProfile.phone ||
+              '+1 (555) 234-8910',
         leadName: target?.fullName || 'Broadcast Recipient',
         subject: personalizedSubject,
         body: personalizedBody,
         listName: campData.targetList,
         source: 'campaign_broadcast',
+        overrideFromIdentity: campData.overrideFromIdentity || undefined,
         workspace,
         privateProfile,
       });
     }
 
     return {
-      eligibleCount: Math.max(eligibleLeads.length, campData.recipientCount),
+      eligibleCount: Math.max(eligibleLeads.length, campData.recipientCount, 1),
       haltedKillSwitchCount,
       lastReceipt,
     };
@@ -1428,39 +1631,45 @@ export default function App() {
     data: Omit<Campaign, 'id' | 'workspaceId' | 'ownerId' | 'createdAt' | 'updatedAt'>
   ) => {
     const cid = generateSafeId('cmp');
-    if (isCloudAuthenticated && currentUser) {
-      const uid = currentUser.uid;
+    const ownerUid = currentUser?.uid || workspace.ownerId;
+    setCampaigns((prev) => [
+      {
+        id: cid,
+        workspaceId: ownerUid,
+        ownerId: ownerUid,
+        ...data,
+      },
+      ...prev,
+    ]);
+
+    if (isCloudAuthenticated && auth.currentUser) {
+      const uid = auth.currentUser.uid;
       try {
-        await setDoc(doc(db, 'campaigns', cid), {
-          workspaceId: uid,
-          ownerId: uid,
-          ...data,
-          createdAt: serverTimestamp(),
-          updatedAt: serverTimestamp(),
-        });
+        await setDoc(
+          doc(db, 'campaigns', cid),
+          sanitizeFirestorePayload({
+            workspaceId: uid,
+            ownerId: uid,
+            ...data,
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          })
+        );
       } catch (error) {
         handleFirestoreError(error, OperationType.CREATE, `campaigns/${cid}`);
       }
-    } else {
-      setCampaigns((prev) => [
-        {
-          id: cid,
-          workspaceId: workspace.id,
-          ownerId: workspace.ownerId,
-          ...data,
-        },
-        ...prev,
-      ]);
     }
 
     if (data.status === 'sent') {
       const dispatchSummary = await executeLiveCampaignBroadcastDispatch({
+        id: cid,
         name: data.name,
         channel: data.channel,
         targetList: data.targetList,
         subjectOrTemplate: data.subjectOrTemplate,
         messageBody: data.messageBody,
         recipientCount: data.recipientCount,
+        overrideFromIdentity: data.overrideFromIdentity,
       });
       await logActivityEvent(
         'campaign_sent',
@@ -1486,12 +1695,14 @@ export default function App() {
     if (camp.status === 'sent') return;
 
     const dispatchSummary = await executeLiveCampaignBroadcastDispatch({
+      id: camp.id,
       name: camp.name,
       channel: camp.channel,
       targetList: camp.targetList,
       subjectOrTemplate: camp.subjectOrTemplate,
       messageBody: camp.messageBody,
       recipientCount: camp.recipientCount,
+      overrideFromIdentity: camp.overrideFromIdentity,
     });
 
     const recipients = dispatchSummary.eligibleCount;
@@ -1499,39 +1710,42 @@ export default function App() {
     const opened = 0;
     const clicked = 0;
 
-    if (isCloudAuthenticated && currentUser) {
+    setCampaigns((prev) =>
+      prev.map((c) =>
+        c.id === camp.id
+          ? {
+              ...c,
+              status: 'sent',
+              recipientCount: recipients,
+              deliveredCount: delivered,
+              openedCount: opened,
+              clickedCount: clicked,
+            }
+          : c
+      )
+    );
+
+    if (isCloudAuthenticated && auth.currentUser) {
       try {
-        await updateDoc(doc(db, 'campaigns', camp.id), {
-          name: camp.name,
-          channel: camp.channel,
-          targetList: camp.targetList,
-          subjectOrTemplate: camp.subjectOrTemplate,
-          messageBody: camp.messageBody,
-          status: 'sent',
-          recipientCount: recipients,
-          deliveredCount: delivered,
-          openedCount: opened,
-          clickedCount: clicked,
-          updatedAt: serverTimestamp(),
-        });
+        await updateDoc(
+          doc(db, 'campaigns', camp.id),
+          sanitizeFirestorePayload({
+            name: camp.name,
+            channel: camp.channel,
+            targetList: camp.targetList,
+            subjectOrTemplate: camp.subjectOrTemplate,
+            messageBody: camp.messageBody,
+            status: 'sent',
+            recipientCount: recipients,
+            deliveredCount: delivered,
+            openedCount: opened,
+            clickedCount: clicked,
+            updatedAt: serverTimestamp(),
+          })
+        );
       } catch (error) {
         handleFirestoreError(error, OperationType.UPDATE, `campaigns/${camp.id}`);
       }
-    } else {
-      setCampaigns((prev) =>
-        prev.map((c) =>
-          c.id === camp.id
-            ? {
-                ...c,
-                status: 'sent',
-                recipientCount: recipients,
-                deliveredCount: delivered,
-                openedCount: opened,
-                clickedCount: clicked,
-              }
-            : c
-        )
-      );
     }
 
     await logActivityEvent(
@@ -1552,31 +1766,33 @@ export default function App() {
     id: string,
     data: Partial<Omit<Campaign, 'id' | 'workspaceId' | 'ownerId' | 'createdAt' | 'updatedAt'>>
   ) => {
-    if (isCloudAuthenticated && currentUser) {
+    setCampaigns((prev) =>
+      prev.map((c) => (c.id === id ? { ...c, ...data } : c))
+    );
+
+    if (isCloudAuthenticated && auth.currentUser) {
       try {
-        await updateDoc(doc(db, 'campaigns', id), {
-          ...data,
-          updatedAt: serverTimestamp(),
-        });
+        await updateDoc(
+          doc(db, 'campaigns', id),
+          sanitizeFirestorePayload({
+            ...data,
+            updatedAt: serverTimestamp(),
+          })
+        );
       } catch (error) {
         handleFirestoreError(error, OperationType.UPDATE, `campaigns/${id}`);
       }
-    } else {
-      setCampaigns((prev) =>
-        prev.map((c) => (c.id === id ? { ...c, ...data } : c))
-      );
     }
   };
 
   const handleDeleteCampaign = async (id: string) => {
-    if (isCloudAuthenticated && currentUser) {
+    setCampaigns((prev) => prev.filter((c) => c.id !== id));
+    if (isCloudAuthenticated && auth.currentUser) {
       try {
         await deleteDoc(doc(db, 'campaigns', id));
       } catch (error) {
         handleFirestoreError(error, OperationType.DELETE, `campaigns/${id}`);
       }
-    } else {
-      setCampaigns((prev) => prev.filter((c) => c.id !== id));
     }
   };
 
@@ -1584,29 +1800,33 @@ export default function App() {
     data: Omit<CaptureAsset, 'id' | 'workspaceId' | 'ownerId' | 'createdAt' | 'updatedAt'>
   ) => {
     const aid = generateSafeId('ast');
-    if (isCloudAuthenticated && currentUser) {
-      const uid = currentUser.uid;
+    const ownerUid = currentUser?.uid || workspace.ownerId;
+    setAssets((prev) => [
+      {
+        id: aid,
+        workspaceId: ownerUid,
+        ownerId: ownerUid,
+        ...data,
+      },
+      ...prev,
+    ]);
+
+    if (isCloudAuthenticated && auth.currentUser) {
+      const uid = auth.currentUser.uid;
       try {
-        await setDoc(doc(db, 'assets', aid), {
-          workspaceId: uid,
-          ownerId: uid,
-          ...data,
-          createdAt: serverTimestamp(),
-          updatedAt: serverTimestamp(),
-        });
+        await setDoc(
+          doc(db, 'assets', aid),
+          sanitizeFirestorePayload({
+            workspaceId: uid,
+            ownerId: uid,
+            ...data,
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          })
+        );
       } catch (error) {
         handleFirestoreError(error, OperationType.CREATE, `assets/${aid}`);
       }
-    } else {
-      setAssets((prev) => [
-        {
-          id: aid,
-          workspaceId: workspace.id,
-          ownerId: workspace.ownerId,
-          ...data,
-        },
-        ...prev,
-      ]);
     }
 
     await logActivityEvent(
@@ -1621,29 +1841,30 @@ export default function App() {
     id: string,
     data: Omit<CaptureAsset, 'id' | 'workspaceId' | 'ownerId' | 'createdAt' | 'updatedAt'>
   ) => {
-    if (isCloudAuthenticated && currentUser) {
+    setAssets((prev) => prev.map((a) => (a.id === id ? { ...a, ...data } : a)));
+    if (isCloudAuthenticated && auth.currentUser) {
       try {
-        await updateDoc(doc(db, 'assets', id), {
-          ...data,
-          updatedAt: serverTimestamp(),
-        });
+        await updateDoc(
+          doc(db, 'assets', id),
+          sanitizeFirestorePayload({
+            ...data,
+            updatedAt: serverTimestamp(),
+          })
+        );
       } catch (error) {
         handleFirestoreError(error, OperationType.UPDATE, `assets/${id}`);
       }
-    } else {
-      setAssets((prev) => prev.map((a) => (a.id === id ? { ...a, ...data } : a)));
     }
   };
 
   const handleDeleteAsset = async (id: string) => {
-    if (isCloudAuthenticated && currentUser) {
+    setAssets((prev) => prev.filter((a) => a.id !== id));
+    if (isCloudAuthenticated && auth.currentUser) {
       try {
         await deleteDoc(doc(db, 'assets', id));
       } catch (error) {
         handleFirestoreError(error, OperationType.DELETE, `assets/${id}`);
       }
-    } else {
-      setAssets((prev) => prev.filter((a) => a.id !== id));
     }
   };
 
@@ -1753,75 +1974,81 @@ export default function App() {
     data: Omit<ChatbotFlow, 'id' | 'workspaceId' | 'ownerId' | 'createdAt' | 'updatedAt'>
   ) => {
     const bid = generateSafeId('bot');
-    if (isCloudAuthenticated && currentUser) {
-      const uid = currentUser.uid;
+    const ownerUid = currentUser?.uid || workspace.ownerId;
+    setChatbots((prev) => [
+      {
+        id: bid,
+        workspaceId: ownerUid,
+        ownerId: ownerUid,
+        ...data,
+      },
+      ...prev,
+    ]);
+
+    if (isCloudAuthenticated && auth.currentUser) {
+      const uid = auth.currentUser.uid;
       try {
-        await setDoc(doc(db, 'chatbots', bid), {
-          workspaceId: uid,
-          ownerId: uid,
-          ...data,
-          createdAt: serverTimestamp(),
-          updatedAt: serverTimestamp(),
-        });
+        await setDoc(
+          doc(db, 'chatbots', bid),
+          sanitizeFirestorePayload({
+            workspaceId: uid,
+            ownerId: uid,
+            ...data,
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          })
+        );
       } catch (error) {
         handleFirestoreError(error, OperationType.CREATE, `chatbots/${bid}`);
       }
-    } else {
-      setChatbots((prev) => [
-        {
-          id: bid,
-          workspaceId: workspace.id,
-          ownerId: workspace.ownerId,
-          ...data,
-        },
-        ...prev,
-      ]);
     }
   };
 
   const handleDeleteChatbot = async (id: string) => {
-    if (isCloudAuthenticated && currentUser) {
+    setChatbots((prev) => prev.filter((b) => b.id !== id));
+    if (isCloudAuthenticated && auth.currentUser) {
       try {
         await deleteDoc(doc(db, 'chatbots', id));
       } catch (error) {
         handleFirestoreError(error, OperationType.DELETE, `chatbots/${id}`);
       }
-    } else {
-      setChatbots((prev) => prev.filter((b) => b.id !== id));
     }
   };
 
   const handleRecordBotSession = async (bot: ChatbotFlow) => {
     if (bot.status === 'archived') return;
-    if (isCloudAuthenticated && currentUser) {
+    setChatbots((prev) =>
+      prev.map((b) =>
+        b.id === bot.id
+          ? {
+              ...b,
+              sessionsCount: b.sessionsCount + 1,
+              resolvedCount: b.resolvedCount + 1,
+            }
+          : b
+      )
+    );
+
+    if (isCloudAuthenticated && auth.currentUser) {
       try {
-        await updateDoc(doc(db, 'chatbots', bot.id), {
-          name: bot.name,
-          triggerKeyword: bot.triggerKeyword,
-          matchType: bot.matchType,
-          welcomeMessage: bot.welcomeMessage,
-          menuOptions: bot.menuOptions,
-          handoffToHuman: bot.handoffToHuman,
-          status: bot.status,
-          sessionsCount: bot.sessionsCount + 1,
-          resolvedCount: bot.resolvedCount + 1,
-          updatedAt: serverTimestamp(),
-        });
+        await updateDoc(
+          doc(db, 'chatbots', bot.id),
+          sanitizeFirestorePayload({
+            name: bot.name,
+            triggerKeyword: bot.triggerKeyword,
+            matchType: bot.matchType,
+            welcomeMessage: bot.welcomeMessage,
+            menuOptions: bot.menuOptions,
+            handoffToHuman: bot.handoffToHuman,
+            status: bot.status,
+            sessionsCount: bot.sessionsCount + 1,
+            resolvedCount: bot.resolvedCount + 1,
+            updatedAt: serverTimestamp(),
+          })
+        );
       } catch (error) {
         handleFirestoreError(error, OperationType.UPDATE, `chatbots/${bot.id}`);
       }
-    } else {
-      setChatbots((prev) =>
-        prev.map((b) =>
-          b.id === bot.id
-            ? {
-                ...b,
-                sessionsCount: b.sessionsCount + 1,
-                resolvedCount: b.resolvedCount + 1,
-              }
-            : b
-        )
-      );
     }
 
     const targetLead = contacts[0];
@@ -1832,7 +2059,7 @@ export default function App() {
       subject: bot.name,
       body: `${bot.welcomeMessage}\n\nOptions:\n${(bot.menuOptions || []).join('\n')}`,
       listName: targetLead?.listName || 'WhatsApp Bot Leads',
-      source: 'auto_responder',
+      source: 'whatsapp_bot',
       workspace,
       privateProfile,
     });
@@ -1849,38 +2076,42 @@ export default function App() {
     data: Omit<AutoResponder, 'id' | 'workspaceId' | 'ownerId' | 'createdAt' | 'updatedAt'>
   ) => {
     const arid = generateSafeId('ar');
-    if (isCloudAuthenticated && currentUser) {
-      const uid = currentUser.uid;
+    const ownerUid = currentUser?.uid || workspace.ownerId;
+    setAutoResponders((prev) => [
+      {
+        id: arid,
+        workspaceId: ownerUid,
+        ownerId: ownerUid,
+        ...data,
+      },
+      ...prev,
+    ]);
+
+    if (isCloudAuthenticated && auth.currentUser) {
+      const uid = auth.currentUser.uid;
       try {
-        await setDoc(doc(db, 'autoresponders', arid), {
-          workspaceId: uid,
-          ownerId: uid,
-          name: data.name.slice(0, 120),
-          targetList: data.targetList.slice(0, 100),
-          triggerMessage: data.triggerMessage.slice(0, 500),
-          responseMessage: data.responseMessage.slice(0, 2000),
-          channel: data.channel,
-          ...(data.matchType ? { matchType: data.matchType } : {}),
-          ...(data.subjectLine ? { subjectLine: data.subjectLine.slice(0, 160) } : {}),
-          status: data.status,
-          triggeredCount: data.triggeredCount || 0,
-          sentCount: data.sentCount || 0,
-          createdAt: serverTimestamp(),
-          updatedAt: serverTimestamp(),
-        });
+        await setDoc(
+          doc(db, 'autoresponders', arid),
+          sanitizeFirestorePayload({
+            workspaceId: uid,
+            ownerId: uid,
+            name: data.name.slice(0, 120),
+            targetList: data.targetList.slice(0, 100),
+            triggerMessage: data.triggerMessage.slice(0, 500),
+            responseMessage: data.responseMessage.slice(0, 2000),
+            channel: data.channel,
+            ...(data.matchType ? { matchType: data.matchType } : {}),
+            ...(data.subjectLine ? { subjectLine: data.subjectLine.slice(0, 160) } : {}),
+            status: data.status,
+            triggeredCount: data.triggeredCount || 0,
+            sentCount: data.sentCount || 0,
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          })
+        );
       } catch (error) {
         handleFirestoreError(error, OperationType.CREATE, `autoresponders/${arid}`);
       }
-    } else {
-      setAutoResponders((prev) => [
-        {
-          id: arid,
-          workspaceId: workspace.id,
-          ownerId: workspace.ownerId,
-          ...data,
-        },
-        ...prev,
-      ]);
     }
 
     await logActivityEvent(
@@ -1895,40 +2126,42 @@ export default function App() {
     id: string,
     data: Omit<AutoResponder, 'id' | 'workspaceId' | 'ownerId' | 'createdAt' | 'updatedAt'>
   ) => {
-    if (isCloudAuthenticated && currentUser) {
+    setAutoResponders((prev) =>
+      prev.map((ar) => (ar.id === id ? { ...ar, ...data } : ar))
+    );
+
+    if (isCloudAuthenticated && auth.currentUser) {
       try {
-        await updateDoc(doc(db, 'autoresponders', id), {
-          name: data.name.slice(0, 120),
-          targetList: data.targetList.slice(0, 100),
-          triggerMessage: data.triggerMessage.slice(0, 500),
-          responseMessage: data.responseMessage.slice(0, 2000),
-          channel: data.channel,
-          ...(data.matchType ? { matchType: data.matchType } : {}),
-          ...(data.subjectLine ? { subjectLine: data.subjectLine.slice(0, 160) } : {}),
-          status: data.status,
-          triggeredCount: data.triggeredCount,
-          sentCount: data.sentCount,
-          updatedAt: serverTimestamp(),
-        });
+        await updateDoc(
+          doc(db, 'autoresponders', id),
+          sanitizeFirestorePayload({
+            name: data.name.slice(0, 120),
+            targetList: data.targetList.slice(0, 100),
+            triggerMessage: data.triggerMessage.slice(0, 500),
+            responseMessage: data.responseMessage.slice(0, 2000),
+            channel: data.channel,
+            ...(data.matchType ? { matchType: data.matchType } : {}),
+            ...(data.subjectLine ? { subjectLine: data.subjectLine.slice(0, 160) } : {}),
+            status: data.status,
+            triggeredCount: data.triggeredCount,
+            sentCount: data.sentCount,
+            updatedAt: serverTimestamp(),
+          })
+        );
       } catch (error) {
         handleFirestoreError(error, OperationType.UPDATE, `autoresponders/${id}`);
       }
-    } else {
-      setAutoResponders((prev) =>
-        prev.map((ar) => (ar.id === id ? { ...ar, ...data } : ar))
-      );
     }
   };
 
   const handleDeleteAutoResponder = async (id: string) => {
-    if (isCloudAuthenticated && currentUser) {
+    setAutoResponders((prev) => prev.filter((ar) => ar.id !== id));
+    if (isCloudAuthenticated && auth.currentUser) {
       try {
         await deleteDoc(doc(db, 'autoresponders', id));
       } catch (error) {
         handleFirestoreError(error, OperationType.DELETE, `autoresponders/${id}`);
       }
-    } else {
-      setAutoResponders((prev) => prev.filter((ar) => ar.id !== id));
     }
   };
 
@@ -1936,40 +2169,44 @@ export default function App() {
     data: Omit<InboxThread, 'id' | 'workspaceId' | 'ownerId' | 'createdAt' | 'updatedAt'>
   ): Promise<string> => {
     const tid = generateSafeId('inb');
-    if (isCloudAuthenticated && currentUser) {
-      const uid = currentUser.uid;
+    const ownerUid = currentUser?.uid || workspace.ownerId;
+    setInboxThreads((prev) => [
+      {
+        id: tid,
+        workspaceId: ownerUid,
+        ownerId: ownerUid,
+        ...data,
+      },
+      ...prev,
+    ]);
+
+    if (isCloudAuthenticated && auth.currentUser) {
+      const uid = auth.currentUser.uid;
       try {
-        await setDoc(doc(db, 'inbox_threads', tid), {
-          workspaceId: uid,
-          ownerId: uid,
-          leadName: data.leadName.slice(0, 120),
-          leadEmail: (data.leadEmail || '').slice(0, 150),
-          leadPhone: (data.leadPhone || '').slice(0, 40),
-          listName: data.listName.slice(0, 100),
-          channel: data.channel,
-          subjectOrContext: data.subjectOrContext.slice(0, 160),
-          lastLeadMessage: data.lastLeadMessage.slice(0, 2000),
-          lastMessagePreview: data.lastMessagePreview.slice(0, 500),
-          lastSender: data.lastSender,
-          status: data.status,
-          unreadCount: data.unreadCount || 0,
-          messagesJson: data.messagesJson.slice(0, 20000),
-          createdAt: serverTimestamp(),
-          updatedAt: serverTimestamp(),
-        });
+        await setDoc(
+          doc(db, 'inbox_threads', tid),
+          sanitizeFirestorePayload({
+            workspaceId: uid,
+            ownerId: uid,
+            leadName: data.leadName.slice(0, 120),
+            leadEmail: (data.leadEmail || '').slice(0, 150),
+            leadPhone: (data.leadPhone || '').slice(0, 40),
+            listName: data.listName.slice(0, 100),
+            channel: data.channel,
+            subjectOrContext: data.subjectOrContext.slice(0, 160),
+            lastLeadMessage: data.lastLeadMessage.slice(0, 2000),
+            lastMessagePreview: data.lastMessagePreview.slice(0, 500),
+            lastSender: data.lastSender,
+            status: data.status,
+            unreadCount: data.unreadCount || 0,
+            messagesJson: data.messagesJson.slice(0, 20000),
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          })
+        );
       } catch (error) {
         handleFirestoreError(error, OperationType.CREATE, `inbox_threads/${tid}`);
       }
-    } else {
-      setInboxThreads((prev) => [
-        {
-          id: tid,
-          workspaceId: workspace.id,
-          ownerId: workspace.ownerId,
-          ...data,
-        },
-        ...prev,
-      ]);
     }
 
     await logActivityEvent(
@@ -1986,42 +2223,44 @@ export default function App() {
     id: string,
     data: Omit<InboxThread, 'id' | 'workspaceId' | 'ownerId' | 'createdAt' | 'updatedAt'>
   ) => {
-    if (isCloudAuthenticated && currentUser) {
+    setInboxThreads((prev) =>
+      prev.map((t) => (t.id === id ? { ...t, ...data } : t))
+    );
+
+    if (isCloudAuthenticated && auth.currentUser) {
       try {
-        await updateDoc(doc(db, 'inbox_threads', id), {
-          leadName: data.leadName.slice(0, 120),
-          leadEmail: (data.leadEmail || '').slice(0, 150),
-          leadPhone: (data.leadPhone || '').slice(0, 40),
-          listName: data.listName.slice(0, 100),
-          channel: data.channel,
-          subjectOrContext: data.subjectOrContext.slice(0, 160),
-          lastLeadMessage: data.lastLeadMessage.slice(0, 2000),
-          lastMessagePreview: data.lastMessagePreview.slice(0, 500),
-          lastSender: data.lastSender,
-          status: data.status,
-          unreadCount: data.unreadCount,
-          messagesJson: data.messagesJson.slice(0, 20000),
-          updatedAt: serverTimestamp(),
-        });
+        await updateDoc(
+          doc(db, 'inbox_threads', id),
+          sanitizeFirestorePayload({
+            leadName: data.leadName.slice(0, 120),
+            leadEmail: (data.leadEmail || '').slice(0, 150),
+            leadPhone: (data.leadPhone || '').slice(0, 40),
+            listName: data.listName.slice(0, 100),
+            channel: data.channel,
+            subjectOrContext: data.subjectOrContext.slice(0, 160),
+            lastLeadMessage: data.lastLeadMessage.slice(0, 2000),
+            lastMessagePreview: data.lastMessagePreview.slice(0, 500),
+            lastSender: data.lastSender,
+            status: data.status,
+            unreadCount: data.unreadCount,
+            messagesJson: data.messagesJson.slice(0, 20000),
+            updatedAt: serverTimestamp(),
+          })
+        );
       } catch (error) {
         handleFirestoreError(error, OperationType.UPDATE, `inbox_threads/${id}`);
       }
-    } else {
-      setInboxThreads((prev) =>
-        prev.map((t) => (t.id === id ? { ...t, ...data } : t))
-      );
     }
   };
 
   const handleDeleteInboxThread = async (id: string) => {
-    if (isCloudAuthenticated && currentUser) {
+    setInboxThreads((prev) => prev.filter((t) => t.id !== id));
+    if (isCloudAuthenticated && auth.currentUser) {
       try {
         await deleteDoc(doc(db, 'inbox_threads', id));
       } catch (error) {
         handleFirestoreError(error, OperationType.DELETE, `inbox_threads/${id}`);
       }
-    } else {
-      setInboxThreads((prev) => prev.filter((t) => t.id !== id));
     }
   };
 
@@ -2383,102 +2622,114 @@ export default function App() {
     data: Omit<TaskItem, 'id' | 'workspaceId' | 'ownerId' | 'createdAt' | 'updatedAt'>
   ) => {
     const tid = generateSafeId('tsk');
-    if (isCloudAuthenticated && currentUser) {
-      const uid = currentUser.uid;
+    const ownerUid = currentUser?.uid || workspace.ownerId;
+    setTasks((prev) => [
+      {
+        id: tid,
+        workspaceId: ownerUid,
+        ownerId: ownerUid,
+        ...data,
+      },
+      ...prev,
+    ]);
+
+    if (isCloudAuthenticated && auth.currentUser) {
+      const uid = auth.currentUser.uid;
       try {
-        await setDoc(doc(db, 'tasks', tid), {
-          workspaceId: uid,
-          ownerId: uid,
-          title: data.title.slice(0, 160),
-          category: data.category,
-          priority: data.priority,
-          dueDate: data.dueDate.slice(0, 40),
-          relatedEntity: data.relatedEntity.slice(0, 100),
-          status: data.status,
-          createdAt: serverTimestamp(),
-          updatedAt: serverTimestamp(),
-        });
+        await setDoc(
+          doc(db, 'tasks', tid),
+          sanitizeFirestorePayload({
+            workspaceId: uid,
+            ownerId: uid,
+            title: data.title.slice(0, 160),
+            category: data.category,
+            priority: data.priority,
+            dueDate: data.dueDate.slice(0, 40),
+            relatedEntity: data.relatedEntity.slice(0, 100),
+            status: data.status,
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          })
+        );
       } catch (error) {
         handleFirestoreError(error, OperationType.CREATE, `tasks/${tid}`);
       }
-    } else {
-      setTasks((prev) => [
-        {
-          id: tid,
-          workspaceId: workspace.id,
-          ownerId: workspace.ownerId,
-          ...data,
-        },
-        ...prev,
-      ]);
     }
   };
 
   const handleDeleteTask = async (taskId: string) => {
-    if (isCloudAuthenticated && currentUser) {
+    setTasks((prev) => prev.filter((t) => t.id !== taskId));
+    if (isCloudAuthenticated && auth.currentUser) {
       try {
         await deleteDoc(doc(db, 'tasks', taskId));
       } catch (error) {
         handleFirestoreError(error, OperationType.DELETE, `tasks/${taskId}`);
       }
-    } else {
-      setTasks((prev) => prev.filter((t) => t.id !== taskId));
     }
   };
 
   const handleCompleteTask = async (task: TaskItem) => {
     if (task.status === 'completed') return;
-    if (isCloudAuthenticated && currentUser) {
+    setTasks((prev) =>
+      prev.map((t) =>
+        t.id === task.id ? { ...t, status: 'completed', dueDate: 'Completed' } : t
+      )
+    );
+
+    if (isCloudAuthenticated && auth.currentUser) {
       try {
-        await updateDoc(doc(db, 'tasks', task.id), {
-          title: task.title,
-          category: task.category,
-          priority: task.priority,
-          dueDate: 'Completed',
-          relatedEntity: task.relatedEntity,
-          status: 'completed',
-          updatedAt: serverTimestamp(),
-        });
+        await updateDoc(
+          doc(db, 'tasks', task.id),
+          sanitizeFirestorePayload({
+            title: task.title,
+            category: task.category,
+            priority: task.priority,
+            dueDate: 'Completed',
+            relatedEntity: task.relatedEntity,
+            status: 'completed',
+            updatedAt: serverTimestamp(),
+          })
+        );
       } catch (error) {
         handleFirestoreError(error, OperationType.UPDATE, `tasks/${task.id}`);
       }
-    } else {
-      setTasks((prev) =>
-        prev.map((t) =>
-          t.id === task.id ? { ...t, status: 'completed', dueDate: 'Completed' } : t
-        )
-      );
     }
   };
 
   const handleUpdateWorkspace = async (
     data: Omit<Workspace, 'id' | 'ownerId' | 'createdAt' | 'updatedAt'>
   ) => {
-    if (isCloudAuthenticated && currentUser) {
-      const uid = currentUser.uid;
+    setWorkspace((prev) => ({ ...prev, ...data }));
+    if (isCloudAuthenticated && auth.currentUser) {
+      const uid = auth.currentUser.uid;
       try {
-        await updateDoc(doc(db, 'workspaces', uid), {
-          ...data,
-          updatedAt: serverTimestamp(),
-        });
+        await updateDoc(
+          doc(db, 'workspaces', uid),
+          sanitizeFirestorePayload({
+            ...data,
+            updatedAt: serverTimestamp(),
+          })
+        );
       } catch (error) {
         handleFirestoreError(error, OperationType.UPDATE, `workspaces/${uid}`);
       }
-    } else {
-      setWorkspace((prev) => ({ ...prev, ...data }));
     }
   };
 
   const handleUpdatePrivateProfile = async (
     data: Omit<UserPrivateProfile, 'id' | 'ownerId' | 'createdAt' | 'updatedAt'>
   ) => {
-    if (isCloudAuthenticated && currentUser) {
-      const uid = currentUser.uid;
+    setPrivateProfile((prev) => ({ ...prev, ...data }));
+    if (isCloudAuthenticated && auth.currentUser) {
+      const uid = auth.currentUser.uid;
       try {
-        await updateDoc(doc(db, 'users', uid, 'private', 'default'), {
-          ...data,
-          updatedAt: serverTimestamp(),
-        });
+        await updateDoc(
+          doc(db, 'users', uid, 'private', 'default'),
+          sanitizeFirestorePayload({
+            ...data,
+            updatedAt: serverTimestamp(),
+          })
+        );
       } catch (error) {
         handleFirestoreError(
           error,
@@ -2486,8 +2737,6 @@ export default function App() {
           `users/${uid}/private/default`
         );
       }
-    } else {
-      setPrivateProfile((prev) => ({ ...prev, ...data }));
     }
   };
 
@@ -2497,19 +2746,36 @@ export default function App() {
     role: MemberRole;
   }) => {
     const mid = generateSafeId('mem');
-    if (isCloudAuthenticated && currentUser) {
-      const uid = currentUser.uid;
+    const ownerUid = currentUser?.uid || workspace.ownerId;
+    setMembers((prev) => [
+      ...prev,
+      {
+        id: mid,
+        workspaceId: ownerUid,
+        ownerId: ownerUid,
+        memberName: data.memberName,
+        memberEmail: data.memberEmail,
+        role: data.role,
+        status: 'active',
+      },
+    ]);
+
+    if (isCloudAuthenticated && auth.currentUser) {
+      const uid = auth.currentUser.uid;
       try {
-        await setDoc(doc(db, 'workspaces', uid, 'members', mid), {
-          workspaceId: uid,
-          ownerId: uid,
-          memberName: data.memberName,
-          memberEmail: data.memberEmail,
-          role: data.role,
-          status: 'active',
-          createdAt: serverTimestamp(),
-          updatedAt: serverTimestamp(),
-        });
+        await setDoc(
+          doc(db, 'workspaces', uid, 'members', mid),
+          sanitizeFirestorePayload({
+            workspaceId: uid,
+            ownerId: uid,
+            memberName: data.memberName,
+            memberEmail: data.memberEmail,
+            role: data.role,
+            status: 'active',
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          })
+        );
       } catch (error) {
         handleFirestoreError(
           error,
@@ -2517,25 +2783,13 @@ export default function App() {
           `workspaces/${uid}/members/${mid}`
         );
       }
-    } else {
-      setMembers((prev) => [
-        ...prev,
-        {
-          id: mid,
-          workspaceId: workspace.id,
-          ownerId: workspace.ownerId,
-          memberName: data.memberName,
-          memberEmail: data.memberEmail,
-          role: data.role,
-          status: 'active',
-        },
-      ]);
     }
   };
 
   const handleDeleteMember = async (memberId: string) => {
-    if (isCloudAuthenticated && currentUser) {
-      const uid = currentUser.uid;
+    setMembers((prev) => prev.filter((m) => m.id !== memberId));
+    if (isCloudAuthenticated && auth.currentUser) {
+      const uid = auth.currentUser.uid;
       try {
         await deleteDoc(doc(db, 'workspaces', uid, 'members', memberId));
       } catch (error) {
@@ -2545,8 +2799,6 @@ export default function App() {
           `workspaces/${uid}/members/${memberId}`
         );
       }
-    } else {
-      setMembers((prev) => prev.filter((m) => m.id !== memberId));
     }
   };
 

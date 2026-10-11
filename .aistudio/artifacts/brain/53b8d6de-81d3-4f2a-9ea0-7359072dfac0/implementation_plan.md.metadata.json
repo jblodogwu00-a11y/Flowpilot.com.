@@ -1,6 +1,6 @@
 {
-  "summary":  "Production Launch-Readiness Plan covering Public Shareable Lead Capture & Funnel Pages with a live CORS-enabled /api/leads/capture endpoint, Automated Unsubscribe Links & Global STOP Opt-Out Suppression Enforcement, Live Email Open & Link Click Tracking Endpoints (/api/track/open, /api/track/click), and Per-User Sender Identity Selection inside Broadcasts and Automations.",
-  "updatedAt":  "2026-10-11T07:24:44.718751915Z",
+  "summary":  "Implementation plan for fixing Manual Email/Password and Google authentication, enabling instant dual-sync workspace persistence (Cloud Firestore + local/server account storage), and ensuring end-to-end reliability across the multi-channel messaging engine.",
+  "updatedAt":  "2026-10-11T11:49:38.750406578Z",
   "requestFeedback":  true,
   "userFacing":  true
 }

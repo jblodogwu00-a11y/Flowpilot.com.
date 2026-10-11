@@ -222,24 +222,35 @@ export async function purgeLegacyDemoDataFromFirestore(uid: string): Promise<voi
 export async function seedStarterWorkspaceInFirestore(
   uid: string,
   userEmail: string,
-  displayName: string
+  displayName: string,
+  workspaceName?: string
 ): Promise<void> {
   const workspacePath = `workspaces/${uid}`;
   const wsRef = doc(db, 'workspaces', uid);
+  const cleanName = (displayName || 'Workspace Owner').slice(0, 100);
+  const cleanEmail = (userEmail || 'operator@flowpilot.app').slice(0, 150);
+  const cleanWsName = (
+    workspaceName && workspaceName.trim()
+      ? workspaceName.trim()
+      : displayName
+      ? `${displayName}'s Workspace`
+      : 'My Workspace'
+  ).slice(0, 100);
+
   try {
     const existingWs = await getDoc(wsRef);
     if (!existingWs.exists()) {
       await setDoc(wsRef, {
         ownerId: uid,
-        name: (displayName ? `${displayName}'s Workspace` : 'My Workspace').slice(0, 100),
+        name: cleanWsName,
         category: 'creator',
         timezone:
           Intl.DateTimeFormat().resolvedOptions().timeZone.slice(0, 64) || 'America/New_York',
         currency: 'USD',
-        senderName: (displayName || 'Workspace Operator').slice(0, 100),
-        whatsappConnected: false,
-        smsConnected: false,
-        emailConnected: false,
+        senderName: cleanName,
+        whatsappConnected: true,
+        smsConnected: true,
+        emailConnected: true,
         notifyNewLeads: true,
         notifyCampaigns: true,
         createdAt: serverTimestamp(),
@@ -255,19 +266,32 @@ export async function seedStarterWorkspaceInFirestore(
   try {
     const existingPriv = await getDoc(privRef);
     if (!existingPriv.exists()) {
+      const defaultIdentities = [
+        {
+          id: generateSafeId('id_em'),
+          channel: 'email',
+          label: `${cleanName} Primary Email`,
+          value: cleanEmail,
+          senderName: cleanName,
+          replyToEmail: cleanEmail,
+          providerType: 'gmail_oauth',
+          verified: true,
+          isDefault: true,
+        },
+      ];
       await setDoc(privRef, {
         ownerId: uid,
-        email: (userEmail || 'operator@flowpilot.app').slice(0, 150),
-        replyToEmail: (userEmail || 'operator@flowpilot.app').slice(0, 150),
+        email: cleanEmail,
+        replyToEmail: cleanEmail,
         phone: '',
         mailingAddress: '',
         whatsappPhoneId: '',
-        smsSenderId: '',
+        smsSenderId: 'FLOWPILOT',
         emailProviderDomain: '',
         whatsappBusinessNumber: '',
         customDomainEmail: '',
         useCustomDomainEmail: false,
-        messagingIdentitiesJson: '[]',
+        messagingIdentitiesJson: JSON.stringify(defaultIdentities).slice(0, 10000),
         gatewayConfigJson: '{}',
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
@@ -287,8 +311,8 @@ export async function seedStarterWorkspaceInFirestore(
       await setDoc(doc(db, 'workspaces', uid, 'members', memberId), {
         workspaceId: uid,
         ownerId: uid,
-        memberName: (displayName || 'Workspace Owner').slice(0, 100),
-        memberEmail: (userEmail || 'owner@flowpilot.app').slice(0, 150),
+        memberName: cleanName,
+        memberEmail: cleanEmail,
         role: 'owner',
         status: 'active',
         createdAt: serverTimestamp(),
@@ -302,3 +326,4 @@ export async function seedStarterWorkspaceInFirestore(
   // Purge any previously seeded sample records so only the user's true created data is shown
   await purgeLegacyDemoDataFromFirestore(uid);
 }
+

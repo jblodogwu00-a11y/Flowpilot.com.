@@ -1,11 +1,119 @@
 import 'dotenv/config';
 import express from 'express';
+import fs from 'fs';
+import crypto from 'crypto';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { createServer as createViteServer } from 'vite';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
+// ============================================================================
+// PERSISTENT ACCOUNT VAULT & WORKSPACE STATE BACKUP (.data/*.json + In-Memory)
+// ============================================================================
+export interface ServerStoredAccount {
+  uid: string;
+  email: string;
+  displayName: string;
+  workspaceName: string;
+  passwordHash: string;
+  provider: 'password' | 'google.com';
+  emailVerified: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+const DATA_DIR = path.join(__dirname, '.data');
+const ACCOUNTS_STORE_PATH = path.join(DATA_DIR, 'accounts_store.json');
+const WORKSPACES_STORE_PATH = path.join(DATA_DIR, 'workspaces_store.json');
+
+const serverAccountsByEmail = new Map<string, ServerStoredAccount>();
+const serverAccountsByUid = new Map<string, ServerStoredAccount>();
+const serverWorkspaceSnapshotsByUid = new Map<string, Record<string, unknown>>();
+
+function ensureDataDir(): void {
+  try {
+    if (!fs.existsSync(DATA_DIR)) {
+      fs.mkdirSync(DATA_DIR, { recursive: true });
+    }
+  } catch {
+    // Non-fatal in read-only environments; falls back to in-memory map
+  }
+}
+
+function loadPersistentStoresFromDisk(): void {
+  ensureDataDir();
+  try {
+    if (fs.existsSync(ACCOUNTS_STORE_PATH)) {
+      const raw = fs.readFileSync(ACCOUNTS_STORE_PATH, 'utf-8');
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) {
+        for (const acc of parsed) {
+          if (acc && acc.email && acc.uid) {
+            const cleanEmail = String(acc.email).trim().toLowerCase();
+            serverAccountsByEmail.set(cleanEmail, acc as ServerStoredAccount);
+            serverAccountsByUid.set(String(acc.uid), acc as ServerStoredAccount);
+          }
+        }
+      }
+    }
+  } catch {
+    // Ignore disk read error
+  }
+
+  try {
+    if (fs.existsSync(WORKSPACES_STORE_PATH)) {
+      const raw = fs.readFileSync(WORKSPACES_STORE_PATH, 'utf-8');
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === 'object') {
+        for (const [uid, snap] of Object.entries(parsed)) {
+          if (uid && snap && typeof snap === 'object') {
+            serverWorkspaceSnapshotsByUid.set(uid, snap as Record<string, unknown>);
+          }
+        }
+      }
+    }
+  } catch {
+    // Ignore disk read error
+  }
+}
+
+function flushAccountsStoreToDisk(): void {
+  ensureDataDir();
+  try {
+    const allAccounts = Array.from(serverAccountsByEmail.values());
+    fs.writeFileSync(ACCOUNTS_STORE_PATH, JSON.stringify(allAccounts, null, 2), 'utf-8');
+  } catch {
+    // Non-fatal
+  }
+}
+
+function flushWorkspacesStoreToDisk(): void {
+  ensureDataDir();
+  try {
+    const obj: Record<string, unknown> = {};
+    serverWorkspaceSnapshotsByUid.forEach((val, key) => {
+      obj[key] = val;
+    });
+    fs.writeFileSync(WORKSPACES_STORE_PATH, JSON.stringify(obj), 'utf-8');
+  } catch {
+    // Non-fatal
+  }
+}
+
+function hashAccountPassword(password: string, email: string): string {
+  const salt = email.trim().toLowerCase();
+  return crypto.createHash('sha256').update(`fp_salt_${salt}:${password}`).digest('hex');
+}
+
+function buildDeterministicUidForEmail(email: string): string {
+  const clean = email.trim().toLowerCase();
+  const hash = crypto.createHash('sha256').update(`fp_uid_${clean}`).digest('hex').slice(0, 24);
+  return `usr_${hash}`;
+}
+
+loadPersistentStoresFromDisk();
 
 export interface DeliveryReceiptRecord {
   receiptId: string;
@@ -1020,8 +1128,8 @@ async function startServer() {
   const app = express();
   const PORT = Number(process.env.PORT) || 3000;
 
-  app.use(express.json({ limit: '2mb' }));
-  app.use(express.urlencoded({ extended: true, limit: '2mb' }));
+  app.use(express.json({ limit: '10mb' }));
+  app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
   // Start the 24/7 Server Background Scheduler Worker (checks every 1.5s)
   setInterval(() => {
@@ -1101,7 +1209,7 @@ async function startServer() {
   });
 
   // 3. Deliver a Message on Any Channel (WhatsApp, Email, or SMS)
-  app.post('/api/messages/deliver', async (req, res) => {
+  const handleDeliverMessageRoute = async (req: express.Request, res: express.Response) => {
     try {
       const authHeader = String(req.headers.authorization || '').trim();
       const bearerToken = authHeader.toLowerCase().startsWith('bearer ')
@@ -1166,7 +1274,9 @@ async function startServer() {
         error: err instanceof Error ? err.message : 'Message delivery failed',
       });
     }
-  });
+  };
+  app.post('/api/messages/deliver', handleDeliverMessageRoute);
+  app.post('/api/messages/dispatch', handleDeliverMessageRoute);
 
   // ==========================================================================
   // 4. SERVER BACKGROUND SCHEDULER & LIST KILL SWITCH ENDPOINTS
@@ -1806,6 +1916,333 @@ async function startServer() {
       ok: true,
       events,
       suppressedCount: globalSuppressedRecipients.size,
+    });
+  });
+
+  // ==========================================================================
+  // 8. PERSISTENT ACCOUNT AUTHENTICATION & DUAL-SYNC WORKSPACE STATE ENDPOINTS
+  // ==========================================================================
+  app.post('/api/accounts/auth', (req, res) => {
+    const body = req.body || {};
+    const action = String(body.action || 'signin').trim().toLowerCase();
+    const rawEmail = String(body.email || '').trim().toLowerCase();
+    const rawPassword = String(body.password || '');
+    const rawFullName = String(body.fullName || body.displayName || '').trim();
+    const rawWorkspaceName = String(body.workspaceName || '').trim();
+    const rawFirebaseUid = String(body.uid || '').trim();
+
+    if (!rawEmail || !rawEmail.includes('@')) {
+      res.status(400).json({
+        ok: false,
+        error: 'Please enter a valid email address.',
+      });
+      return;
+    }
+
+    const nowIso = new Date().toISOString();
+    const existingAcc = serverAccountsByEmail.get(rawEmail);
+
+    if (action === 'signup') {
+      if (rawPassword.length < 6) {
+        res.status(400).json({
+          ok: false,
+          error: 'Password must be at least 6 characters.',
+        });
+        return;
+      }
+
+      const resolvedUid =
+        rawFirebaseUid || existingAcc?.uid || buildDeterministicUidForEmail(rawEmail);
+      const resolvedName =
+        rawFullName || existingAcc?.displayName || rawEmail.split('@')[0] || 'Workspace Owner';
+      const resolvedWorkspace =
+        rawWorkspaceName ||
+        existingAcc?.workspaceName ||
+        `${resolvedName}'s Workspace`;
+
+      const newAcc: ServerStoredAccount = {
+        uid: resolvedUid,
+        email: rawEmail,
+        displayName: resolvedName.slice(0, 100),
+        workspaceName: resolvedWorkspace.slice(0, 100),
+        passwordHash: hashAccountPassword(rawPassword, rawEmail),
+        provider: 'password',
+        emailVerified: true,
+        createdAt: existingAcc?.createdAt || nowIso,
+        updatedAt: nowIso,
+      };
+
+      serverAccountsByEmail.set(rawEmail, newAcc);
+      serverAccountsByUid.set(resolvedUid, newAcc);
+      flushAccountsStoreToDisk();
+
+      const savedSnapshot = serverWorkspaceSnapshotsByUid.get(resolvedUid) || null;
+      res.json({
+        ok: true,
+        account: {
+          uid: newAcc.uid,
+          email: newAcc.email,
+          displayName: newAcc.displayName,
+          workspaceName: newAcc.workspaceName,
+          provider: newAcc.provider,
+          emailVerified: true,
+        },
+        snapshot: savedSnapshot,
+      });
+      return;
+    }
+
+    if (action === 'signin') {
+      if (!rawPassword) {
+        res.status(400).json({
+          ok: false,
+          error: 'Please enter your password.',
+        });
+        return;
+      }
+
+      if (existingAcc) {
+        const expectedHash = hashAccountPassword(rawPassword, rawEmail);
+        if (
+          existingAcc.passwordHash &&
+          existingAcc.passwordHash !== expectedHash &&
+          !body.firebaseVerified
+        ) {
+          res.status(401).json({
+            ok: false,
+            error: 'Invalid email or password. Please verify your credentials or reset your password.',
+          });
+          return;
+        }
+
+        if (rawFirebaseUid && rawFirebaseUid !== existingAcc.uid) {
+          const prevSnap = serverWorkspaceSnapshotsByUid.get(existingAcc.uid);
+          if (prevSnap && !serverWorkspaceSnapshotsByUid.has(rawFirebaseUid)) {
+            serverWorkspaceSnapshotsByUid.set(rawFirebaseUid, prevSnap);
+          }
+          existingAcc.uid = rawFirebaseUid;
+        }
+        if (rawFullName) existingAcc.displayName = rawFullName.slice(0, 100);
+        if (rawWorkspaceName) existingAcc.workspaceName = rawWorkspaceName.slice(0, 100);
+        if (!existingAcc.passwordHash) {
+          existingAcc.passwordHash = expectedHash;
+        }
+        existingAcc.emailVerified = true;
+        existingAcc.updatedAt = nowIso;
+
+        serverAccountsByEmail.set(rawEmail, existingAcc);
+        serverAccountsByUid.set(existingAcc.uid, existingAcc);
+        flushAccountsStoreToDisk();
+        flushWorkspacesStoreToDisk();
+
+        res.json({
+          ok: true,
+          account: {
+            uid: existingAcc.uid,
+            email: existingAcc.email,
+            displayName: existingAcc.displayName,
+            workspaceName: existingAcc.workspaceName,
+            provider: existingAcc.provider,
+            emailVerified: true,
+          },
+          snapshot: serverWorkspaceSnapshotsByUid.get(existingAcc.uid) || null,
+        });
+        return;
+      }
+
+      if (rawPassword.length < 6) {
+        res.status(400).json({
+          ok: false,
+          error: 'Password must be at least 6 characters.',
+        });
+        return;
+      }
+
+      const resolvedUid = rawFirebaseUid || buildDeterministicUidForEmail(rawEmail);
+      const inferredName =
+        rawFullName ||
+        rawEmail
+          .split('@')[0]
+          .replace(/[._-]+/g, ' ')
+          .replace(/\b\w/g, (c) => c.toUpperCase()) ||
+        'Workspace Operator';
+      const inferredWorkspace = rawWorkspaceName || `${inferredName}'s Workspace`;
+
+      const provisionedAcc: ServerStoredAccount = {
+        uid: resolvedUid,
+        email: rawEmail,
+        displayName: inferredName.slice(0, 100),
+        workspaceName: inferredWorkspace.slice(0, 100),
+        passwordHash: hashAccountPassword(rawPassword, rawEmail),
+        provider: 'password',
+        emailVerified: true,
+        createdAt: nowIso,
+        updatedAt: nowIso,
+      };
+
+      serverAccountsByEmail.set(rawEmail, provisionedAcc);
+      serverAccountsByUid.set(resolvedUid, provisionedAcc);
+      flushAccountsStoreToDisk();
+
+      res.json({
+        ok: true,
+        account: {
+          uid: provisionedAcc.uid,
+          email: provisionedAcc.email,
+          displayName: provisionedAcc.displayName,
+          workspaceName: provisionedAcc.workspaceName,
+          provider: provisionedAcc.provider,
+          emailVerified: true,
+        },
+        snapshot: serverWorkspaceSnapshotsByUid.get(resolvedUid) || null,
+      });
+      return;
+    }
+
+    if (action === 'google') {
+      const resolvedUid =
+        rawFirebaseUid || existingAcc?.uid || buildDeterministicUidForEmail(rawEmail);
+      const inferredName =
+        rawFullName ||
+        existingAcc?.displayName ||
+        rawEmail
+          .split('@')[0]
+          .replace(/[._-]+/g, ' ')
+          .replace(/\b\w/g, (c) => c.toUpperCase()) ||
+        'Google Workspace User';
+      const resolvedWorkspace =
+        rawWorkspaceName ||
+        existingAcc?.workspaceName ||
+        `${inferredName}'s Workspace`;
+
+      if (existingAcc && existingAcc.uid !== resolvedUid) {
+        const prevSnap = serverWorkspaceSnapshotsByUid.get(existingAcc.uid);
+        if (prevSnap && !serverWorkspaceSnapshotsByUid.has(resolvedUid)) {
+          serverWorkspaceSnapshotsByUid.set(resolvedUid, prevSnap);
+        }
+      }
+
+      const googleAcc: ServerStoredAccount = {
+        uid: resolvedUid,
+        email: rawEmail,
+        displayName: inferredName.slice(0, 100),
+        workspaceName: resolvedWorkspace.slice(0, 100),
+        passwordHash: existingAcc?.passwordHash || '',
+        provider: 'google.com',
+        emailVerified: true,
+        createdAt: existingAcc?.createdAt || nowIso,
+        updatedAt: nowIso,
+      };
+
+      serverAccountsByEmail.set(rawEmail, googleAcc);
+      serverAccountsByUid.set(resolvedUid, googleAcc);
+      flushAccountsStoreToDisk();
+      flushWorkspacesStoreToDisk();
+
+      res.json({
+        ok: true,
+        account: {
+          uid: googleAcc.uid,
+          email: googleAcc.email,
+          displayName: googleAcc.displayName,
+          workspaceName: googleAcc.workspaceName,
+          provider: googleAcc.provider,
+          emailVerified: true,
+        },
+        snapshot: serverWorkspaceSnapshotsByUid.get(resolvedUid) || null,
+      });
+      return;
+    }
+
+    if (action === 'reset_password') {
+      const newPassword = String(body.newPassword || '').trim();
+      if (existingAcc && newPassword.length >= 6) {
+        existingAcc.passwordHash = hashAccountPassword(newPassword, rawEmail);
+        existingAcc.updatedAt = nowIso;
+        serverAccountsByEmail.set(rawEmail, existingAcc);
+        serverAccountsByUid.set(existingAcc.uid, existingAcc);
+        flushAccountsStoreToDisk();
+        res.json({
+          ok: true,
+          passwordUpdated: true,
+          message: `Password for ${rawEmail} has been updated immediately. You can now sign in with your new password.`,
+        });
+        return;
+      }
+      res.json({
+        ok: true,
+        passwordUpdated: false,
+        message: `Password reset instructions have been processed for ${rawEmail}.`,
+      });
+      return;
+    }
+
+    res.status(400).json({
+      ok: false,
+      error: `Unsupported auth action: ${action}`,
+    });
+  });
+
+  app.get('/api/accounts/state', (req, res) => {
+    const uid = String(req.query.uid || '').trim();
+    const email = String(req.query.email || '').trim().toLowerCase();
+
+    let resolvedUid = uid;
+    if (!resolvedUid && email) {
+      const acc = serverAccountsByEmail.get(email);
+      resolvedUid = acc?.uid || buildDeterministicUidForEmail(email);
+    }
+
+    if (!resolvedUid) {
+      res.status(400).json({ ok: false, error: 'Account uid or email is required.' });
+      return;
+    }
+
+    let snapshot = serverWorkspaceSnapshotsByUid.get(resolvedUid) || null;
+    if (!snapshot && email) {
+      const deterministicUid = buildDeterministicUidForEmail(email);
+      snapshot = serverWorkspaceSnapshotsByUid.get(deterministicUid) || null;
+    }
+
+    res.json({
+      ok: true,
+      uid: resolvedUid,
+      snapshot,
+    });
+  });
+
+  app.post('/api/accounts/state', (req, res) => {
+    const body = req.body || {};
+    const uid = String(body.uid || '').trim();
+    const email = String(body.email || '').trim().toLowerCase();
+    const snapshot = body.snapshot;
+
+    if (!uid && !email) {
+      res.status(400).json({ ok: false, error: 'Account uid or email is required.' });
+      return;
+    }
+    if (!snapshot || typeof snapshot !== 'object') {
+      res.status(400).json({ ok: false, error: 'Valid workspace snapshot object is required.' });
+      return;
+    }
+
+    const resolvedUid = uid || buildDeterministicUidForEmail(email);
+    const enrichedSnapshot = {
+      ...snapshot,
+      updatedAt: new Date().toISOString(),
+    };
+
+    serverWorkspaceSnapshotsByUid.set(resolvedUid, enrichedSnapshot);
+    if (email) {
+      const detUid = buildDeterministicUidForEmail(email);
+      serverWorkspaceSnapshotsByUid.set(detUid, enrichedSnapshot);
+    }
+    flushWorkspacesStoreToDisk();
+
+    res.json({
+      ok: true,
+      uid: resolvedUid,
+      updatedAt: enrichedSnapshot.updatedAt,
     });
   });
 

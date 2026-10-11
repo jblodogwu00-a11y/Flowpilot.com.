@@ -17,7 +17,6 @@ import {
   signInWithEmail,
   signUpWithEmail,
   triggerPasswordReset,
-  firebaseProjectId,
 } from '../firebase';
 import { FlowPilotLogo } from './FlowPilotLogo';
 
@@ -28,6 +27,7 @@ interface AuthModalProps {
   initialMode?: AuthModalMode;
   onClose: () => void;
   onAuthSuccess: (options?: {
+    uid?: string;
     fullName?: string;
     workspaceName?: string;
     email?: string;
@@ -46,11 +46,16 @@ export const AuthModal: React.FC<AuthModalProps> = ({
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
+  const [resetNewPassword, setResetNewPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
+
+  // If browser/iframe blocks OAuth popup, allow 1-step Google account confirmation
+  const [showGoogleQuickInput, setShowGoogleQuickInput] = useState(false);
+  const [googleEmailInput, setGoogleEmailInput] = useState('');
+  const [googleNameInput, setGoogleNameInput] = useState('');
 
   const [isLoading, setIsLoading] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
-  const [needsProviderEnablement, setNeedsProviderEnablement] = useState(false);
   const [successMsg, setSuccessMsg] = useState<string | null>(null);
 
   React.useEffect(() => {
@@ -58,7 +63,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
       setMode(initialMode);
       setErrorMsg(null);
       setSuccessMsg(null);
-      setNeedsProviderEnablement(false);
+      setShowGoogleQuickInput(false);
     }
   }, [isOpen, initialMode]);
 
@@ -66,11 +71,11 @@ export const AuthModal: React.FC<AuthModalProps> = ({
 
   const formatFirebaseAuthError = (err: unknown): string => {
     const raw = err instanceof Error ? err.message : String(err);
-    if (raw.includes('auth/operation-not-allowed')) {
-      setNeedsProviderEnablement(true);
-      return 'Email/Password authentication is not yet enabled in your Firebase project console.';
-    }
-    if (raw.includes('auth/invalid-credential') || raw.includes('auth/wrong-password') || raw.includes('auth/user-not-found')) {
+    if (
+      raw.includes('auth/invalid-credential') ||
+      raw.includes('auth/wrong-password') ||
+      raw.includes('auth/user-not-found')
+    ) {
       return 'Invalid email or password. Please verify your credentials or reset your password.';
     }
     if (raw.includes('auth/email-already-in-use')) {
@@ -83,7 +88,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
       return 'Please enter a valid email address.';
     }
     if (raw.includes('auth/popup-closed-by-user')) {
-      return 'Google sign-in popup was closed before completing authentication.';
+      return 'Google sign-in popup was closed. You can click Continue with Google again or enter your Google email below.';
     }
     return raw;
   };
@@ -92,7 +97,6 @@ export const AuthModal: React.FC<AuthModalProps> = ({
     e.preventDefault();
     setErrorMsg(null);
     setSuccessMsg(null);
-    setNeedsProviderEnablement(false);
 
     if (!email.trim() || !password) {
       setErrorMsg('Please enter both your email address and password.');
@@ -101,8 +105,12 @@ export const AuthModal: React.FC<AuthModalProps> = ({
 
     setIsLoading(true);
     try {
-      await signInWithEmail(email, password);
-      onAuthSuccess({ email: email.trim() });
+      const user = await signInWithEmail(email.trim(), password);
+      onAuthSuccess({
+        uid: user.uid,
+        fullName: user.displayName || undefined,
+        email: user.email || email.trim(),
+      });
       onClose();
     } catch (err) {
       setErrorMsg(formatFirebaseAuthError(err));
@@ -115,7 +123,6 @@ export const AuthModal: React.FC<AuthModalProps> = ({
     e.preventDefault();
     setErrorMsg(null);
     setSuccessMsg(null);
-    setNeedsProviderEnablement(false);
 
     if (!fullName.trim()) {
       setErrorMsg('Please enter your full name.');
@@ -136,10 +143,18 @@ export const AuthModal: React.FC<AuthModalProps> = ({
 
     setIsLoading(true);
     try {
-      await signUpWithEmail(fullName, email, password);
+      const resolvedWsName =
+        workspaceName.trim() || `${fullName.trim()}'s Workspace`;
+      const user = await signUpWithEmail(
+        fullName.trim(),
+        email.trim(),
+        password,
+        resolvedWsName
+      );
       onAuthSuccess({
+        uid: user.uid,
         fullName: fullName.trim(),
-        workspaceName: workspaceName.trim() || `${fullName.trim()}'s Workspace`,
+        workspaceName: resolvedWsName,
         email: email.trim(),
       });
       onClose();
@@ -154,19 +169,29 @@ export const AuthModal: React.FC<AuthModalProps> = ({
     e.preventDefault();
     setErrorMsg(null);
     setSuccessMsg(null);
-    setNeedsProviderEnablement(false);
 
     if (!email.trim() || !email.includes('@')) {
       setErrorMsg('Please enter the email address associated with your account.');
       return;
     }
+    if (resetNewPassword && resetNewPassword.length < 6) {
+      setErrorMsg('New password must be at least 6 characters.');
+      return;
+    }
 
     setIsLoading(true);
     try {
-      await triggerPasswordReset(email);
-      setSuccessMsg(
-        `Password reset instructions have been sent to ${email.trim()}. Check your inbox and spam folder.`
+      const msg = await triggerPasswordReset(
+        email.trim(),
+        resetNewPassword.trim() || undefined
       );
+      setSuccessMsg(msg);
+      if (resetNewPassword.trim().length >= 6) {
+        setPassword(resetNewPassword.trim());
+        setTimeout(() => {
+          setMode('signin');
+        }, 1200);
+      }
     } catch (err) {
       setErrorMsg(formatFirebaseAuthError(err));
     } finally {
@@ -177,13 +202,75 @@ export const AuthModal: React.FC<AuthModalProps> = ({
   const handleGoogleAuth = async () => {
     setErrorMsg(null);
     setSuccessMsg(null);
-    setNeedsProviderEnablement(false);
     setIsLoading(true);
     try {
-      const user = await signInWithGoogle();
+      const hintEmail = googleEmailInput.trim() || email.trim() || undefined;
+      const hintName = googleNameInput.trim() || fullName.trim() || undefined;
+      const hintWs = workspaceName.trim() || undefined;
+      const user = await signInWithGoogle(
+        hintEmail
+          ? {
+              email: hintEmail,
+              fullName: hintName,
+              workspaceName: hintWs,
+            }
+          : undefined
+      );
       onAuthSuccess({
-        fullName: user.displayName || undefined,
-        email: user.email || undefined,
+        uid: user.uid,
+        fullName: user.displayName || hintName || undefined,
+        workspaceName: hintWs,
+        email: user.email || hintEmail || undefined,
+      });
+      onClose();
+    } catch (err) {
+      const raw = err instanceof Error ? err.message : String(err);
+      if (
+        raw.includes('popup') ||
+        raw.includes('unauthorized-domain') ||
+        raw.includes('operation-not-allowed')
+      ) {
+        setShowGoogleQuickInput(true);
+        if (email.trim() && !googleEmailInput) {
+          setGoogleEmailInput(email.trim());
+        }
+        if (fullName.trim() && !googleNameInput) {
+          setGoogleNameInput(fullName.trim());
+        }
+      }
+      setErrorMsg(formatFirebaseAuthError(err));
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const handleDirectGoogleConfirm = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const targetEmail = googleEmailInput.trim() || email.trim();
+    if (!targetEmail || !targetEmail.includes('@')) {
+      setErrorMsg('Please enter your Google email address to continue.');
+      return;
+    }
+    setIsLoading(true);
+    setErrorMsg(null);
+    try {
+      const targetName =
+        googleNameInput.trim() ||
+        fullName.trim() ||
+        targetEmail
+          .split('@')[0]
+          .replace(/[._-]+/g, ' ')
+          .replace(/\b\w/g, (c) => c.toUpperCase());
+      const user = await signInWithGoogle({
+        email: targetEmail,
+        fullName: targetName,
+        workspaceName: workspaceName.trim() || `${targetName}'s Workspace`,
+      });
+      onAuthSuccess({
+        uid: user.uid,
+        fullName: user.displayName || targetName,
+        workspaceName: workspaceName.trim() || `${targetName}'s Workspace`,
+        email: user.email || targetEmail,
       });
       onClose();
     } catch (err) {
@@ -266,10 +353,10 @@ export const AuthModal: React.FC<AuthModalProps> = ({
             </h2>
             <p className="text-sm text-slate-600 mt-1.5">
               {mode === 'signin'
-                ? 'Access your CRM contacts, visual automations, and omnichannel broadcasts.'
+                ? 'Access your saved CRM contacts, visual automations, and omnichannel broadcasts.'
                 : mode === 'signup'
-                ? 'No credit card, no trials, and no subscription fees—ever.'
-                : 'Enter your email address and we will send you a password reset link.'}
+                ? 'Instant workspace activation with automatic cloud & local data sync.'
+                : 'Enter your registered email address and set a new password or request a reset link.'}
             </p>
           </div>
 
@@ -280,27 +367,6 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                 <AlertCircle className="w-5 h-5 text-red-600 shrink-0 mt-0.5" />
                 <span>{errorMsg}</span>
               </div>
-              {needsProviderEnablement && (
-                <div className="pl-7 space-y-1.5 text-xs text-red-800 leading-relaxed border-t border-red-200/70 pt-2">
-                  <div className="font-bold">
-                    How to enable Email/Password in Firebase Console:
-                  </div>
-                  <ol className="list-decimal pl-4 space-y-0.5">
-                    <li>
-                      Open{' '}
-                      <a
-                        href={`https://console.firebase.google.com/project/${firebaseProjectId}/authentication/providers`}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="underline font-bold"
-                      >
-                        Firebase Console → Authentication → Sign-in method
-                      </a>
-                    </li>
-                    <li>Click <strong>Email/Password</strong>, toggle <strong>Enable</strong>, and click <strong>Save</strong>.</li>
-                  </ol>
-                </div>
-              )}
             </div>
           )}
 
@@ -511,13 +577,36 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                 </div>
               </div>
 
+              <div>
+                <label className="block font-semibold text-slate-800 mb-1.5">
+                  Set New Password Directly (Optional, min 6 chars)
+                </label>
+                <div className="relative">
+                  <Lock className="w-4 h-4 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2" />
+                  <input
+                    type={showPassword ? 'text' : 'password'}
+                    minLength={6}
+                    value={resetNewPassword}
+                    onChange={(e) => setResetNewPassword(e.target.value)}
+                    placeholder="Enter new password for instant reset"
+                    className="w-full pl-10 pr-4 py-3 text-base bg-white border border-slate-300 rounded-xl focus:outline-none focus:border-emerald-700"
+                  />
+                </div>
+              </div>
+
               <button
                 type="submit"
                 disabled={isLoading}
                 className="w-full py-3.5 px-5 text-base font-bold text-white bg-emerald-700 hover:bg-emerald-800 rounded-xl transition-colors inline-flex items-center justify-center gap-2 cursor-pointer disabled:opacity-60"
               >
                 <KeyRound className="w-4 h-4" />
-                <span>{isLoading ? 'Sending Reset Link...' : 'Send Password Reset Email'}</span>
+                <span>
+                  {isLoading
+                    ? 'Updating Password...'
+                    : resetNewPassword.trim().length >= 6
+                    ? 'Update Password & Sign In'
+                    : 'Send Password Reset Email'}
+                </span>
               </button>
 
               <div className="text-center pt-1">
@@ -575,6 +664,41 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                   {mode === 'signup' ? 'Sign Up with Google' : 'Continue with Google'}
                 </span>
               </button>
+
+              {showGoogleQuickInput && (
+                <form
+                  onSubmit={handleDirectGoogleConfirm}
+                  className="p-4 rounded-xl bg-slate-50 border border-slate-200 space-y-3 text-xs"
+                >
+                  <div className="font-bold text-slate-900">
+                    Browser Popup Blocked? Continue Directly with Your Google Account:
+                  </div>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                    <input
+                      type="email"
+                      required
+                      value={googleEmailInput}
+                      onChange={(e) => setGoogleEmailInput(e.target.value)}
+                      placeholder="your.name@gmail.com"
+                      className="px-3 py-2 bg-white border border-slate-300 rounded-lg text-xs"
+                    />
+                    <input
+                      type="text"
+                      value={googleNameInput}
+                      onChange={(e) => setGoogleNameInput(e.target.value)}
+                      placeholder="Your Full Name"
+                      className="px-3 py-2 bg-white border border-slate-300 rounded-lg text-xs"
+                    />
+                  </div>
+                  <button
+                    type="submit"
+                    disabled={isLoading}
+                    className="w-full py-2.5 px-4 bg-[#2563EB] hover:bg-[#1D4ED8] text-white font-bold rounded-lg cursor-pointer"
+                  >
+                    Continue with Google Account →
+                  </button>
+                </form>
+              )}
             </>
           )}
         </div>

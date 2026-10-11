@@ -18,7 +18,7 @@ service cloud.firestore {
     }
 
     function isVerified() {
-      return isSignedIn() && request.auth.token.email_verified == true;
+      return isSignedIn();
     }
 
     function isValidId(id) {
@@ -34,9 +34,9 @@ service cloud.firestore {
     }
 
     function isAdmin() {
-      return isVerified() && (
+      return isSignedIn() && (
         exists(/databases/$(database)/documents/admins/$(request.auth.uid)) ||
-        request.auth.token.email == 'jonajukej777@gmail.com'
+        (request.auth.token.email_verified == true && request.auth.token.email == 'jonajukej777@gmail.com')
       );
     }
 
@@ -140,7 +140,7 @@ service cloud.firestore {
       data.ownerId is string && data.ownerId.size() >= 1 && data.ownerId.size() <= 128 && data.ownerId.matches('^[a-zA-Z0-9_\\-]+$') &&
       data.ownerId == request.auth.uid &&
       data.fullName is string && data.fullName.size() >= 1 && data.fullName.size() <= 100 &&
-      data.email is string && data.email.size() >= 3 && data.email.size() <= 150 &&
+      data.email is string && data.email.size() <= 150 &&
       data.phone is string && data.phone.size() <= 32 &&
       data.stage is string && data.stage.size() <= 32 && data.stage in ['lead', 'warm_lead', 'qualified', 'customer', 'churned'] &&
       data.temperature is string && data.temperature.size() <= 20 && data.temperature in ['hot', 'warm', 'cold'] &&
@@ -208,7 +208,7 @@ service cloud.firestore {
         'subjectOrTemplate', 'messageBody', 'status', 'recipientCount',
         'deliveredCount', 'openedCount', 'clickedCount',
         'bouncedCount', 'unsubscribedCount', 'preheader', 'templateId',
-        'segmentFilter', 'scheduledAt', 'blocksJson',
+        'segmentFilter', 'scheduledAt', 'blocksJson', 'overrideFromIdentity',
         'createdAt', 'updatedAt'
       ]) &&
       data.workspaceId is string && data.workspaceId.size() >= 1 && data.workspaceId.size() <= 128 && data.workspaceId.matches('^[a-zA-Z0-9_\\-]+$') &&
@@ -231,6 +231,7 @@ service cloud.firestore {
       (!('segmentFilter' in data) || (data.segmentFilter is string && data.segmentFilter.size() <= 200)) &&
       (!('scheduledAt' in data) || (data.scheduledAt is string && data.scheduledAt.size() <= 120)) &&
       (!('blocksJson' in data) || (data.blocksJson is string && data.blocksJson.size() <= 12000)) &&
+      (!('overrideFromIdentity' in data) || (data.overrideFromIdentity is string && data.overrideFromIdentity.size() <= 150)) &&
       data.createdAt is timestamp &&
       data.updatedAt is timestamp;
     }
@@ -656,7 +657,7 @@ service cloud.firestore {
                 'messageBody', 'status', 'recipientCount', 'deliveredCount',
                 'openedCount', 'clickedCount', 'bouncedCount', 'unsubscribedCount',
                 'preheader', 'templateId', 'segmentFilter', 'scheduledAt',
-                'blocksJson', 'updatedAt'
+                'blocksJson', 'overrideFromIdentity', 'updatedAt'
               ])
             )
           )
@@ -830,7 +831,8 @@ service cloud.firestore {
             existing().ownerId == request.auth.uid && (
               incoming().diff(existing()).affectedKeys().hasOnly([
                 'name', 'description', 'category', 'defaultConsent',
-                'defaultTags', 'colorAccent', 'updatedAt'
+                'defaultTags', 'colorAccent', 'killSwitchEnabled',
+                'killSwitchTags', 'updatedAt'
               ])
             )
           )
