@@ -426,28 +426,35 @@ export function resolvePersonalizationVariables(
   sampleContact?: Contact | null,
   workspace?: Workspace,
   privateProfile?: UserPrivateProfile,
-  fallbackListName?: string
+  fallbackListName?: string,
+  campaignId?: string
 ): string {
   if (!rawText) return '';
   const fullName = sampleContact?.fullName?.trim() || 'Amara Nwosu';
   const firstName = fullName.split(' ')[0] || 'there';
   const email = sampleContact?.email?.trim() || 'subscriber@example.com';
+  const phone = sampleContact?.phone?.trim() || '+1 (555) 234-8910';
   const company = sampleContact?.company?.trim() || 'Your Organization';
   const listName = sampleContact?.listName?.trim() || fallbackListName || 'Subscribers List';
   const senderName = workspace?.senderName?.trim() || 'FlowPilot Operator';
-  const domain = privateProfile?.emailProviderDomain?.trim() || 'mail.flowpilot.app';
+  const origin =
+    typeof window !== 'undefined' && window.location?.origin
+      ? window.location.origin
+      : `https://${privateProfile?.emailProviderDomain?.trim() || 'mail.flowpilot.app'}`;
+  const unsubUrl = `${origin}/?unsubscribe=${encodeURIComponent(email || phone)}${
+    campaignId ? `&campaignId=${encodeURIComponent(campaignId)}` : ''
+  }`;
 
   return rawText
     .replace(/\{\{\s*first_name\s*\}\}/gi, firstName)
     .replace(/\{\{\s*full_name\s*\}\}/gi, fullName)
+    .replace(/\{\{\s*name\s*\}\}/gi, fullName)
     .replace(/\{\{\s*email\s*\}\}/gi, email)
+    .replace(/\{\{\s*phone\s*\}\}/gi, phone)
     .replace(/\{\{\s*company\s*\}\}/gi, company)
     .replace(/\{\{\s*list_name\s*\}\}/gi, listName)
     .replace(/\{\{\s*sender_name\s*\}\}/gi, senderName)
-    .replace(
-      /\{\{\s*unsubscribe_url\s*\}\}/gi,
-      `https://${domain}/unsubscribe?e=${encodeURIComponent(email)}`
-    );
+    .replace(/\{\{\s*unsubscribe_url\s*\}\}/gi, unsubUrl);
 }
 
 const DECEPTIVE_SUBJECT_PATTERNS: { regex: RegExp; reason: string }[] = [

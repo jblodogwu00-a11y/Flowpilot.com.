@@ -76,6 +76,10 @@ import {
   setActiveGatewayAccountUid,
   hydrateGatewayConfigFromPrivateProfile,
   pollAndConsumeInboundWebhooks,
+  pollAndConsumePublicLeadCaptures,
+  pollAndConsumeTrackingComplianceEvents,
+  submitPublicLeadToCaptureWebhook,
+  triggerOneClickUnsubscribe,
 } from './services/messageDeliveryService';
 import {
   DEMO_WORKSPACE,
@@ -139,13 +143,23 @@ export default function App() {
     });
   };
 
-  // Standalone Shareable Lead Capture URL state (?capture=<slug>)
+  // Standalone Shareable Lead Capture URL state (?capture=<slug> | ?page=<slug> | ?form=<slug>)
   const [publicCaptureSlug, setPublicCaptureSlug] = useState<string | null>(() => {
     if (typeof window !== 'undefined') {
-      return new URLSearchParams(window.location.search).get('capture');
+      const sp = new URLSearchParams(window.location.search);
+      return sp.get('capture') || sp.get('page') || sp.get('form');
     }
     return null;
   });
+  // Standalone One-Click Global Unsubscribe URL state (?unsubscribe=<emailOrPhone>)
+  const [publicUnsubscribeRecipient, setPublicUnsubscribeRecipient] = useState<string | null>(() => {
+    if (typeof window !== 'undefined') {
+      return new URLSearchParams(window.location.search).get('unsubscribe');
+    }
+    return null;
+  });
+  const [unsubConfirmed, setUnsubConfirmed] = useState<boolean>(false);
+  const [unsubRestored, setUnsubRestored] = useState<boolean>(false);
   const [pubName, setPubName] = useState('');
   const [pubEmail, setPubEmail] = useState('');
   const [pubPhone, setPubPhone] = useState('');
@@ -2077,23 +2091,70 @@ export default function App() {
     });
   };
 
-  // Poll & process live inbound webhooks from /api/webhooks/inbound (WhatsApp, Email, SMS)
+  // Poll & process live inbound webhooks (/api/webhooks/inbound), public lead captures (/api/leads/capture), and tracking/unsubscribe events (/api/track/events)
   useEffect(() => {
     if (viewMode !== 'workspace') return;
     const interval = setInterval(async () => {
+      // A. Poll Inbound Messaging Webhooks (WhatsApp, Email, SMS)
       const items = await pollAndConsumeInboundWebhooks();
-      if (items.length === 0) return;
-
       for (const item of items) {
         const cleanChannel: ChannelType =
           item.channel === 'email' || item.channel === 'sms' ? item.channel : 'whatsapp';
         const cleanLeadName = item.leadName || 'Inbound Lead';
         const cleanList = item.listName || lists[0]?.name || 'General Contacts';
         const cleanMessage = item.message || 'Hello!';
+        const trimmedUpper = cleanMessage.trim().toUpperCase();
+        const isOptOutKeyword = ['STOP', 'STOPALL', 'UNSUBSCRIBE', 'CANCEL', 'END', 'QUIT'].includes(
+          trimmedUpper
+        );
         const nowTime = new Date().toLocaleTimeString([], {
           hour: '2-digit',
           minute: '2-digit',
         });
+
+        // If inbound message is STOP / UNSUBSCRIBE, enforce global suppression across all channels
+        if (isOptOutKeyword) {
+          const senderLookup = (item.leadEmail || item.leadPhone || '').trim().toLowerCase();
+          const senderDigits = (item.leadPhone || '').replace(/\D/g, '');
+          const matchedContact = contacts.find((c) => {
+            if (senderLookup && c.email.trim().toLowerCase() === senderLookup) return true;
+            const cDigits = (c.phone || '').replace(/\D/g, '');
+            return (
+              senderDigits.length >= 7 &&
+              cDigits.length >= 7 &&
+              (cDigits.endsWith(senderDigits) || senderDigits.endsWith(cDigits))
+            );
+          });
+          if (matchedContact) {
+            const supTags = Array.from(
+              new Set([...(matchedContact.tags || []), 'unsubscribed', 'global-opt-out'])
+            ).slice(0, 10);
+            await handleUpdateContact(matchedContact.id, {
+              fullName: matchedContact.fullName,
+              email: matchedContact.email,
+              phone: matchedContact.phone,
+              company: matchedContact.company,
+              dealTitle: matchedContact.dealTitle,
+              stage: matchedContact.stage,
+              temperature: matchedContact.temperature,
+              source: matchedContact.source,
+              consentStatus: 'unsubscribed',
+              commChannels: [],
+              listName: matchedContact.listName,
+              tags: supTags,
+              ltv: matchedContact.ltv,
+              notes: `${matchedContact.notes || ''} [Global Opt-Out via Inbound "${trimmedUpper}"]`
+                .trim()
+                .slice(0, 500),
+              customFields: matchedContact.customFields,
+            });
+          }
+          await triggerOneClickUnsubscribe({
+            recipient: item.leadEmail || item.leadPhone || cleanLeadName,
+            reason: `Inbound ${cleanChannel.toUpperCase()} keyword "${trimmedUpper}"`,
+            action: 'unsubscribe',
+          });
+        }
 
         const threadMsgs: Array<{
           id: string;
@@ -2113,15 +2174,17 @@ export default function App() {
           },
         ];
 
-        // 1. Check matching active Auto Responder
-        const matchedAr = autoResponders.find((ar) => {
-          if (ar.status !== 'live' || ar.channel !== cleanChannel) return false;
-          if (ar.matchType === 'any_inbound') return true;
-          if (ar.matchType === 'exact') {
-            return cleanMessage.trim().toLowerCase() === ar.triggerMessage.trim().toLowerCase();
-          }
-          return cleanMessage.toLowerCase().includes(ar.triggerMessage.trim().toLowerCase());
-        });
+        // 1. Check matching active Auto Responder (skip if lead just opted out)
+        const matchedAr = !isOptOutKeyword
+          ? autoResponders.find((ar) => {
+              if (ar.status !== 'live' || ar.channel !== cleanChannel) return false;
+              if (ar.matchType === 'any_inbound') return true;
+              if (ar.matchType === 'exact') {
+                return cleanMessage.trim().toLowerCase() === ar.triggerMessage.trim().toLowerCase();
+              }
+              return cleanMessage.toLowerCase().includes(ar.triggerMessage.trim().toLowerCase());
+            })
+          : undefined;
 
         let autoDispatchedText = '';
         let autoDispatchedLabel = '';
@@ -2147,7 +2210,7 @@ export default function App() {
             workspace,
             privateProfile,
           });
-        } else if (cleanChannel === 'whatsapp') {
+        } else if (!isOptOutKeyword && cleanChannel === 'whatsapp') {
           // 2. Check matching active WhatsApp Keyword Bot
           const matchedBot = chatbots.find((b) => {
             if (b.status !== 'active') return false;
@@ -2203,9 +2266,118 @@ export default function App() {
           messagesJson: JSON.stringify(threadMsgs),
         });
       }
+
+      // B. Poll Public Lead Capture Submissions (POST /api/leads/capture)
+      const capturedLeads = await pollAndConsumePublicLeadCaptures();
+      for (const leadItem of capturedLeads) {
+        const matchedAsset =
+          assets.find((a) => a.slug.toLowerCase() === leadItem.assetSlug.toLowerCase()) ||
+          assets[0];
+        if (matchedAsset) {
+          await handleSubmitAssetLead(
+            {
+              ...matchedAsset,
+              targetList: leadItem.targetList || matchedAsset.targetList,
+            },
+            {
+              fullName: leadItem.fullName,
+              email: leadItem.email,
+              phone: leadItem.phone,
+            },
+            {
+              customTags: leadItem.tags,
+              customFields: leadItem.customFields,
+              company: leadItem.company || undefined,
+              notes: leadItem.notes || undefined,
+            }
+          );
+        }
+      }
+
+      // C. Poll Live Email Open, Link Click & Global Unsubscribe Events
+      const trackingEvents = await pollAndConsumeTrackingComplianceEvents();
+      for (const trk of trackingEvents) {
+        if (trk.eventType === 'open' || trk.eventType === 'click') {
+          const targetCamp =
+            campaigns.find((c) => c.id === trk.campaignId) ||
+            campaigns.find((c) => c.status === 'sent') ||
+            campaigns[0];
+          if (targetCamp) {
+            const nextOpened =
+              trk.eventType === 'open' ? targetCamp.openedCount + 1 : targetCamp.openedCount;
+            const nextClicked =
+              trk.eventType === 'click' ? targetCamp.clickedCount + 1 : targetCamp.clickedCount;
+            await handleUpdateCampaign(targetCamp.id, {
+              openedCount: nextOpened,
+              clickedCount: nextClicked,
+            });
+            await logActivityEvent(
+              'campaign_sent',
+              `Live ${trk.eventType === 'open' ? 'Email Open' : 'Link Click'} Tracked: ${targetCamp.name}`,
+              `Recipient: ${trk.recipient || 'Subscriber'}${
+                trk.targetUrl ? ` → ${trk.targetUrl}` : ''
+              }`,
+              targetCamp.channel
+            );
+          }
+        } else if (trk.eventType === 'unsubscribe' || trk.eventType === 'resubscribe') {
+          const isUnsub = trk.eventType === 'unsubscribe';
+          const recClean = (trk.recipient || '').trim().toLowerCase();
+          const recDigits = (trk.recipient || '').replace(/\D/g, '');
+          const matchedContact = contacts.find((c) => {
+            if (recClean && c.email.trim().toLowerCase() === recClean) return true;
+            const cDigits = (c.phone || '').replace(/\D/g, '');
+            return (
+              recDigits.length >= 7 &&
+              cDigits.length >= 7 &&
+              (cDigits.endsWith(recDigits) || recDigits.endsWith(cDigits))
+            );
+          });
+          if (matchedContact) {
+            const updatedTags = isUnsub
+              ? Array.from(
+                  new Set([...(matchedContact.tags || []), 'unsubscribed', 'global-opt-out'])
+                ).slice(0, 10)
+              : (matchedContact.tags || []).filter(
+                  (t) => t !== 'unsubscribed' && t !== 'global-opt-out' && t !== 'suppressed'
+                );
+            await handleUpdateContact(matchedContact.id, {
+              fullName: matchedContact.fullName,
+              email: matchedContact.email,
+              phone: matchedContact.phone,
+              company: matchedContact.company,
+              dealTitle: matchedContact.dealTitle,
+              stage: matchedContact.stage,
+              temperature: matchedContact.temperature,
+              source: matchedContact.source,
+              consentStatus: isUnsub ? 'unsubscribed' : 'opted_in',
+              commChannels: isUnsub ? [] : ['email', 'whatsapp', 'sms'],
+              listName: matchedContact.listName,
+              tags: updatedTags,
+              ltv: matchedContact.ltv,
+              notes: `${matchedContact.notes || ''} [${
+                isUnsub ? 'Global Unsubscribe Opt-Out' : 'Opt-In Restored'
+              }]`
+                .trim()
+                .slice(0, 500),
+              customFields: matchedContact.customFields,
+            });
+          }
+        }
+      }
     }, 4000);
     return () => clearInterval(interval);
-  }, [viewMode, autoResponders, chatbots, lists, workspace, privateProfile]);
+  }, [
+    viewMode,
+    autoResponders,
+    chatbots,
+    lists,
+    assets,
+    campaigns,
+    contacts,
+    workspace,
+    privateProfile,
+  ]);
 
   const handleCreateTask = async (
     data: Omit<TaskItem, 'id' | 'workspaceId' | 'ownerId' | 'createdAt' | 'updatedAt'>
@@ -2417,7 +2589,113 @@ export default function App() {
     }
   };
 
-  // Public Shareable Lead Capture Route (?capture=<slug>)
+  // Standalone Public One-Click Unsubscribe & Global Suppression Route (?unsubscribe=<recipient>)
+  if (publicUnsubscribeRecipient) {
+    return (
+      <div className="min-h-screen bg-[#F8FAFC] text-[#0F172A] flex flex-col justify-between">
+        <header className="bg-[#0F172A] text-white px-4 sm:px-8 py-3.5 flex items-center justify-between border-b border-slate-800">
+          <FlowPilotLogo variant="dark" size="sm" />
+          <button
+            type="button"
+            onClick={() => {
+              if (typeof window !== 'undefined') {
+                const url = new URL(window.location.href);
+                url.searchParams.delete('unsubscribe');
+                url.searchParams.delete('campaignId');
+                url.searchParams.delete('automationId');
+                window.history.replaceState({}, '', url.toString());
+              }
+              setPublicUnsubscribeRecipient(null);
+              setViewMode('workspace');
+              setActiveTab('campaigns');
+            }}
+            className="px-3 py-1.5 text-xs font-bold text-emerald-300 bg-slate-900 hover:bg-slate-800 border border-slate-700 rounded-lg cursor-pointer"
+          >
+            ← Back to Workspace
+          </button>
+        </header>
+
+        <main className="flex-1 flex items-center justify-center p-4 sm:p-8">
+          <div className="max-w-lg w-full bg-white border border-slate-200 border-t-4 border-t-emerald-700 rounded-2xl p-6 sm:p-8 shadow-sm space-y-5">
+            <div className="space-y-2">
+              <div className="text-xs font-bold uppercase tracking-wider text-emerald-700">
+                Global Subscription &amp; Compliance Center
+              </div>
+              <h1 className="font-display text-2xl font-bold text-slate-950">
+                Manage Communication Preferences
+              </h1>
+              <p className="text-sm text-slate-600">
+                Recipient Identity:{' '}
+                <span className="font-mono font-bold text-slate-900">
+                  {publicUnsubscribeRecipient}
+                </span>
+              </p>
+            </div>
+
+            {unsubConfirmed && !unsubRestored ? (
+              <div className="p-5 rounded-xl bg-emerald-50 border border-emerald-200 space-y-3">
+                <div className="font-bold text-emerald-950 text-sm">
+                  Global Opt-Out Confirmed Across All Channels
+                </div>
+                <p className="text-xs text-emerald-900 leading-relaxed">
+                  <strong>{publicUnsubscribeRecipient}</strong> has been added to the global
+                  suppression registry and removed from all Email, WhatsApp, and SMS broadcasts and
+                  automated workflows.
+                </p>
+                <button
+                  type="button"
+                  onClick={async () => {
+                    await triggerOneClickUnsubscribe({
+                      recipient: publicUnsubscribeRecipient,
+                      action: 'resubscribe',
+                      reason: 'User self-restored opt-in from preference page',
+                    });
+                    setUnsubRestored(true);
+                  }}
+                  className="px-4 py-2 text-xs font-bold text-slate-900 bg-white border border-slate-300 hover:bg-slate-100 rounded-lg cursor-pointer"
+                >
+                  Changed your mind? Re-Subscribe to Updates
+                </button>
+              </div>
+            ) : unsubRestored ? (
+              <div className="p-5 rounded-xl bg-blue-50 border border-blue-200 space-y-2">
+                <div className="font-bold text-blue-950 text-sm">
+                  Subscription Restored
+                </div>
+                <p className="text-xs text-blue-900">
+                  <strong>{publicUnsubscribeRecipient}</strong> has been removed from global
+                  suppression and opted back in to workspace communications.
+                </p>
+              </div>
+            ) : (
+              <div className="space-y-4">
+                <p className="text-xs text-slate-600 leading-relaxed">
+                  Click below to immediately opt out of all future Email, WhatsApp, and SMS
+                  messages from <strong>{workspace.name}</strong>.
+                </p>
+                <button
+                  type="button"
+                  onClick={async () => {
+                    await triggerOneClickUnsubscribe({
+                      recipient: publicUnsubscribeRecipient,
+                      action: 'unsubscribe',
+                      reason: 'One-click unsubscribe link clicked',
+                    });
+                    setUnsubConfirmed(true);
+                  }}
+                  className="w-full py-3 px-5 text-sm font-bold text-white bg-red-600 hover:bg-red-700 rounded-xl transition-colors cursor-pointer"
+                >
+                  Confirm One-Click Unsubscribe (All Channels)
+                </button>
+              </div>
+            )}
+          </div>
+        </main>
+      </div>
+    );
+  }
+
+  // Public Shareable Lead Capture Route (?capture=<slug> | ?page=<slug> | ?form=<slug>)
   if (publicCaptureSlug) {
     const matchedAsset = assets.find(
       (a) => a.slug.toLowerCase() === publicCaptureSlug.toLowerCase()
@@ -2462,6 +2740,8 @@ export default function App() {
               if (typeof window !== 'undefined') {
                 const url = new URL(window.location.href);
                 url.searchParams.delete('capture');
+                url.searchParams.delete('page');
+                url.searchParams.delete('form');
                 window.history.replaceState({}, '', url.toString());
               }
               setPublicCaptureSlug(null);
@@ -2470,7 +2750,7 @@ export default function App() {
             }}
             className="px-3 py-1.5 text-xs font-bold text-emerald-300 bg-slate-900 hover:bg-slate-800 border border-slate-700 rounded-lg cursor-pointer"
           >
-            ← Back to Pages & Forms Studio
+            ← Back to Pages &amp; Forms Studio
           </button>
         </header>
 
@@ -2489,7 +2769,7 @@ export default function App() {
             {pubSubmitted ? (
               <div className="p-5 rounded-xl bg-emerald-50 border border-emerald-200 space-y-3">
                 <div className="font-bold text-emerald-950 text-sm">
-                  Thank you! Your details have been submitted.
+                  Thank you! Your details have been submitted and routed to "{matchedAsset.targetList}".
                 </div>
                 <p className="text-xs text-emerald-900">
                   Click the button below to continue to your destination link:
@@ -2511,6 +2791,14 @@ export default function App() {
                 onSubmit={async (e) => {
                   e.preventDefault();
                   if (!pubName.trim() || !pubEmail.trim()) return;
+                  await submitPublicLeadToCaptureWebhook({
+                    assetSlug: matchedAsset.slug,
+                    targetList: matchedAsset.targetList,
+                    fullName: pubName.trim(),
+                    email: pubEmail.trim(),
+                    phone: pubPhone.trim(),
+                    redirectUrl: savedRedirect,
+                  });
                   await handleSubmitAssetLead(matchedAsset, {
                     fullName: pubName.trim(),
                     email: pubEmail.trim(),

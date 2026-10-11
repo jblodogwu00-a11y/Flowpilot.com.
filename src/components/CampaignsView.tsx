@@ -45,6 +45,9 @@ import {
   UserPrivateProfile,
   Automation,
   ActivityLog,
+  UserMessagingIdentity,
+  parseSavedMessagingIdentities,
+  resolveWorkspaceSenderIdentities,
   sanitizeString,
 } from '../types';
 import {
@@ -62,7 +65,11 @@ import {
   SMS_SEQUENCE_BLUEPRINTS,
   calculateSmsSegments,
 } from './EmailMarketingCatalog';
-import { deliverChannelMessage } from '../services/messageDeliveryService';
+import {
+  deliverChannelMessage,
+  triggerOneClickUnsubscribe,
+  triggerLiveTrackingTestEvent,
+} from '../services/messageDeliveryService';
 
 interface CampaignsViewProps {
   campaigns: Campaign[];
@@ -168,10 +175,64 @@ export const CampaignsView: React.FC<CampaignsViewProps> = ({
   // Campaign / Broadcast Builder state
   const [name, setName] = useState('');
   const [channel, setChannel] = useState<ChannelType>('email');
+  const [selectedSenderIdentityId, setSelectedSenderIdentityId] = useState<string>('');
   const [targetList, setTargetList] = useState('');
   const [subjectOrTemplate, setSubjectOrTemplate] = useState(
     DEFAULT_REUSABLE_EMAIL_TEMPLATES[0].subject
   );
+
+  // Per-user saved sender identities for the currently selected channel
+  const channelSenderIdentities = useMemo<UserMessagingIdentity[]>(() => {
+    const saved = parseSavedMessagingIdentities(privateProfile?.savedIdentitiesJson);
+    const matching = saved.filter((item) => item.channel === channel);
+    if (matching.length > 0) return matching;
+    const resolved = resolveWorkspaceSenderIdentities(workspace, privateProfile);
+    if (channel === 'whatsapp') {
+      return [
+        {
+          id: 'default_wa_primary',
+          channel: 'whatsapp',
+          label: 'Primary WhatsApp Business',
+          value: resolved.whatsappBusinessNumber,
+          displayName: workspace?.senderName || 'FlowPilot Operator',
+          isPrimary: true,
+          verified: true,
+        },
+      ];
+    }
+    if (channel === 'sms') {
+      return [
+        {
+          id: 'default_sms_primary',
+          channel: 'sms',
+          label: 'Primary SMS Sender ID',
+          value: resolved.smsSenderId,
+          displayName: workspace?.senderName || 'FlowPilot Operator',
+          isPrimary: true,
+          verified: true,
+        },
+      ];
+    }
+    return [
+      {
+        id: 'default_email_primary',
+        channel: 'email',
+        label: 'Primary Sender Email',
+        value: resolved.activeSenderEmail,
+        displayName: workspace?.senderName || 'FlowPilot Operator',
+        isPrimary: true,
+        verified: true,
+      },
+    ];
+  }, [privateProfile, workspace, channel]);
+
+  const activeSelectedSenderIdentity = useMemo<UserMessagingIdentity | undefined>(() => {
+    if (selectedSenderIdentityId) {
+      const found = channelSenderIdentities.find((i) => i.id === selectedSenderIdentityId);
+      if (found) return found;
+    }
+    return channelSenderIdentities.find((i) => i.isPrimary) || channelSenderIdentities[0];
+  }, [channelSenderIdentities, selectedSenderIdentityId]);
   const [preheader, setPreheader] = useState(DEFAULT_REUSABLE_EMAIL_TEMPLATES[0].preheader);
   const [editorMode, setEditorMode] = useState<'visual_blocks' | 'plain_text'>('visual_blocks');
   const [emailBlocks, setEmailBlocks] = useState<EmailBlock[]>(
@@ -528,6 +589,11 @@ export const CampaignsView: React.FC<CampaignsViewProps> = ({
         `Added ${cleanPhone} (${smsStopKeywordInput}) to the SMS Opt-Out Suppression Registry.`
       );
     }
+    await triggerOneClickUnsubscribe({
+      recipient: cleanPhone,
+      reason: `Inbound SMS ${smsStopKeywordInput}`,
+      action: 'unsubscribe',
+    });
     setSmsStopPhoneInput('');
     setTimeout(() => setSmsConsentFeedback(null), 5000);
   };
@@ -812,6 +878,9 @@ export const CampaignsView: React.FC<CampaignsViewProps> = ({
       body: resolvedBody,
       listName: targetList || 'Broadcast Test',
       source: 'live_test',
+      overrideFromIdentity: activeSelectedSenderIdentity?.value,
+      overrideSenderName:
+        activeSelectedSenderIdentity?.displayName || workspace?.senderName,
       workspace,
       privateProfile,
     });
@@ -1035,6 +1104,11 @@ export const CampaignsView: React.FC<CampaignsViewProps> = ({
         `Added ${cleanEmail} to Global Suppression List (${suppressReasonInput.replace('_', ' ')}).`
       );
     }
+    await triggerOneClickUnsubscribe({
+      recipient: cleanEmail,
+      reason: suppressReasonInput,
+      action: 'unsubscribe',
+    });
     setSuppressEmailInput('');
     setTimeout(() => setSuppressionFeedback(null), 4000);
   };
@@ -1061,6 +1135,18 @@ export const CampaignsView: React.FC<CampaignsViewProps> = ({
       notes: `${contact.notes || ''} [Re-verified opt-in consent]`.trim().slice(0, 500),
       customFields: contact.customFields,
     });
+    if (contact.email) {
+      await triggerOneClickUnsubscribe({
+        recipient: contact.email,
+        action: 'resubscribe',
+      });
+    }
+    if (contact.phone) {
+      await triggerOneClickUnsubscribe({
+        recipient: contact.phone,
+        action: 'resubscribe',
+      });
+    }
   };
 
   const handleSaveSenderConfig = async (e: React.FormEvent) => {
@@ -2728,9 +2814,40 @@ export const CampaignsView: React.FC<CampaignsViewProps> = ({
                       <span className="text-slate-400 mx-1.5">·</span>
                       <span className="font-mono text-[#047857] font-bold">{camp.targetList}</span>
                     </div>
-                    <div className="font-mono text-slate-600">
-                      {camp.deliveredCount} delivered · {camp.openedCount} opened ({openPct}%) ·{' '}
-                      {camp.clickedCount} clicked ({clickPct}%)
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="font-mono text-slate-600">
+                        {camp.deliveredCount} delivered · {camp.openedCount} opened ({openPct}%) ·{' '}
+                        {camp.clickedCount} clicked ({clickPct}%) · {camp.unsubscribedCount || 0} unsub
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          triggerLiveTrackingTestEvent({
+                            type: 'open',
+                            recipient: samplePreviewContact?.email || 'subscriber@example.com',
+                            campaignId: camp.id,
+                          })
+                        }
+                        className="px-2 py-1 text-[11px] font-bold text-[#047857] bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 rounded-md cursor-pointer"
+                        title="Fire live GET /api/track/open pixel event for this campaign"
+                      >
+                        + Live Open Pixel
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          triggerLiveTrackingTestEvent({
+                            type: 'click',
+                            recipient: samplePreviewContact?.email || 'subscriber@example.com',
+                            campaignId: camp.id,
+                            targetUrl: 'https://flowpilot.app/offer',
+                          })
+                        }
+                        className="px-2 py-1 text-[11px] font-bold text-slate-800 bg-white hover:bg-slate-100 border border-slate-300 rounded-md cursor-pointer"
+                        title="Fire live GET /api/track/click redirect event for this campaign"
+                      >
+                        + Live Link Click
+                      </button>
                     </div>
                   </div>
                   <div className="w-full h-2 bg-slate-200 rounded-full overflow-hidden flex">
@@ -2902,8 +3019,8 @@ export const CampaignsView: React.FC<CampaignsViewProps> = ({
                 </div>
               </div>
 
-              {/* STEP 2: CAMPAIGN METADATA, REUSABLE TEMPLATES & PERSONALIZATION */}
-              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+              {/* STEP 2: CAMPAIGN METADATA, SENDER IDENTITY, REUSABLE TEMPLATES & PERSONALIZATION */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
                 <div>
                   <label className="block font-bold text-slate-700 mb-1">
                     {dispatchNow ? 'Broadcast Title *' : 'Campaign Name *'}
@@ -2925,12 +3042,39 @@ export const CampaignsView: React.FC<CampaignsViewProps> = ({
                   <label className="block font-bold text-slate-700 mb-1">Delivery Channel *</label>
                   <select
                     value={channel}
-                    onChange={(e) => setChannel(e.target.value as ChannelType)}
+                    onChange={(e) => {
+                      setChannel(e.target.value as ChannelType);
+                      setSelectedSenderIdentityId('');
+                    }}
                     className="w-full px-3 py-2 bg-white border border-slate-300 rounded-lg font-semibold"
                   >
                     <option value="email">Email Marketing (Visual Editor + SPF/DKIM)</option>
                     <option value="whatsapp">Official WhatsApp Cloud API</option>
                     <option value="sms">Compliant Direct SMS</option>
+                  </select>
+                </div>
+
+                <div>
+                  <label className="block font-bold text-slate-700 mb-1">
+                    Send From Identity ({channel.toUpperCase()}) *
+                  </label>
+                  <select
+                    value={activeSelectedSenderIdentity?.id || ''}
+                    onChange={(e) => {
+                      const nextId = e.target.value;
+                      setSelectedSenderIdentityId(nextId);
+                      const picked = channelSenderIdentities.find((i) => i.id === nextId);
+                      if (picked && channel === 'email') {
+                        setFromEmailInput(picked.value);
+                      }
+                    }}
+                    className="w-full px-3 py-2 bg-white border border-slate-300 rounded-lg font-mono text-xs font-semibold text-slate-900"
+                  >
+                    {channelSenderIdentities.map((ident) => (
+                      <option key={ident.id} value={ident.id}>
+                        {ident.label}: {ident.value} {ident.isPrimary ? '(Primary)' : ''}
+                      </option>
+                    ))}
                   </select>
                 </div>
 

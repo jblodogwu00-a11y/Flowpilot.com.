@@ -38,6 +38,70 @@ const inboundWebhookQueue: Array<{
   receivedAt: string;
 }> = [];
 
+export interface PublicLeadSubmissionEvent {
+  id: string;
+  assetId: string;
+  assetName: string;
+  targetList: string;
+  fullName: string;
+  email: string;
+  phone: string;
+  company: string;
+  customTags: string[];
+  automationIdToTrigger?: string;
+  createdAt: string;
+}
+
+export interface TrackingComplianceEvent {
+  id: string;
+  type: 'open' | 'click' | 'unsubscribe' | 'resubscribe';
+  campaignId?: string;
+  automationId?: string;
+  recipient: string;
+  targetUrl?: string;
+  reason?: string;
+  createdAt: string;
+}
+
+const publicLeadSubmissionsQueue: PublicLeadSubmissionEvent[] = [];
+const trackingComplianceQueue: TrackingComplianceEvent[] = [];
+const globalSuppressedRecipients = new Set<string>();
+
+function getSuppressionKeysForRecipient(raw: string): string[] {
+  const keys: string[] = [];
+  const trimmed = String(raw || '').trim().toLowerCase();
+  if (!trimmed) return keys;
+  if (trimmed.includes('@')) {
+    keys.push(`email:${trimmed}`);
+  }
+  const digits = trimmed.replace(/[^0-9]/g, '');
+  if (digits.length >= 6) {
+    keys.push(`phone:${digits}`);
+  }
+  keys.push(`raw:${trimmed}`);
+  return keys;
+}
+
+function isRecipientGloballySuppressed(raw: string): boolean {
+  const keys = getSuppressionKeysForRecipient(raw);
+  return keys.some((k) => globalSuppressedRecipients.has(k));
+}
+
+function markRecipientGloballySuppressed(raw: string): void {
+  const keys = getSuppressionKeysForRecipient(raw);
+  keys.forEach((k) => globalSuppressedRecipients.add(k));
+}
+
+function removeRecipientFromGlobalSuppression(raw: string): void {
+  const keys = getSuppressionKeysForRecipient(raw);
+  keys.forEach((k) => globalSuppressedRecipients.delete(k));
+}
+
+const TRANSPARENT_1X1_GIF = Buffer.from(
+  'R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7',
+  'base64'
+);
+
 function normalizePhoneForWhatsApp(rawPhone: string): string {
   const digits = (rawPhone || '').replace(/[^0-9]/g, '');
   return digits || '15552348910';
@@ -585,6 +649,32 @@ async function executeUnifiedServerDispatch(params: {
   const cleanBody = String(params.body || '').trim();
   const cleanSubject = String(params.subject || `Message from ${params.senderName}`).trim();
 
+  // Enforce Global Multi-Channel Suppression Gate
+  if (isRecipientGloballySuppressed(cleanTo)) {
+    const suppressedReceipt: DeliveryReceiptRecord = {
+      receiptId: `rcpt_suppressed_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+      channel: cleanChannel,
+      status: 'failed',
+      providerUsed: 'Global Suppression Gate (Opt-Out Enforced)',
+      fromIdentity: cleanFrom,
+      senderName: params.senderName,
+      toRecipient: cleanTo,
+      leadName: String(params.leadName || 'Lead Contact'),
+      ...(cleanChannel === 'email' && cleanSubject ? { subject: cleanSubject } : {}),
+      bodyPreview: cleanBody.slice(0, 240),
+      source: String(params.source || 'manual'),
+      listName: String(params.listName || 'General Contacts'),
+      directLaunchUrl: buildDirectLaunchUrl(cleanChannel, cleanTo, cleanSubject, cleanBody),
+      timestamp: new Date().toISOString(),
+      detailMessage: `Blocked by Global Compliance Gate: ${cleanTo} has opted out (Unsubscribe / STOP) across all channels.`,
+    };
+    recentDeliveryReceipts.unshift(suppressedReceipt);
+    if (recentDeliveryReceipts.length > 100) {
+      recentDeliveryReceipts.pop();
+    }
+    return suppressedReceipt;
+  }
+
   let dispatchResult: { deliveredViaApi: boolean; provider: string; detail: string };
   if (cleanChannel === 'whatsapp') {
     dispatchResult = await dispatchWhatsAppCloudOrTwilio({
@@ -808,6 +898,25 @@ function evaluateServerJobKillSwitch(job: ScheduledAutomationJob): {
   matchedTag: string;
   reason: string;
 } {
+  const mergedContactTags = getMergedContactTagsForJob(job);
+  job.contactTags = mergedContactTags;
+
+  // 1. Check Global Suppression / Unsubscribe / Opt-Out first (always enforced)
+  if (
+    isRecipientGloballySuppressed(job.toRecipient) ||
+    isRecipientGloballySuppressed(job.contactEmail) ||
+    isRecipientGloballySuppressed(job.contactPhone) ||
+    mergedContactTags.some((ct) =>
+      ['unsubscribed', 'suppressed', 'bounced', 'opt_out', 'stop'].includes(normalizeTagToken(ct))
+    )
+  ) {
+    return {
+      halted: true,
+      matchedTag: 'Unsubscribed',
+      reason: `Stopped by Global Compliance Gate: Contact ${job.contactName} has opted out (Unsubscribe / STOP).`,
+    };
+  }
+
   const listKey = normalizeLookupKey(job.listName || '');
   const syncedRule = syncedListKillSwitchRules.get(listKey);
 
@@ -824,9 +933,6 @@ function evaluateServerJobKillSwitch(job: ScheduledAutomationJob): {
       : job.killSwitchTags && job.killSwitchTags.length > 0
       ? job.killSwitchTags
       : ['Purchased_Course'];
-
-  const mergedContactTags = getMergedContactTagsForJob(job);
-  job.contactTags = mergedContactTags;
 
   for (const rawKillTag of activeKillSwitchTags) {
     const normKill = normalizeTagToken(rawKillTag);
@@ -915,6 +1021,7 @@ async function startServer() {
   const PORT = Number(process.env.PORT) || 3000;
 
   app.use(express.json({ limit: '2mb' }));
+  app.use(express.urlencoded({ extended: true, limit: '2mb' }));
 
   // Start the 24/7 Server Background Scheduler Worker (checks every 1.5s)
   setInterval(() => {
@@ -1211,12 +1318,26 @@ async function startServer() {
       if (Array.isArray(contacts)) {
         for (const c of contacts) {
           if (!c) continue;
+          const cTags = Array.isArray(c.tags) ? c.tags : [];
           recordContactTagsInServerRegistry({
             id: c.id,
             email: c.email,
             phone: c.phone,
-            tags: Array.isArray(c.tags) ? c.tags : [],
+            tags: cTags,
           });
+          const isUnsub =
+            c.consentStatus === 'unsubscribed' ||
+            c.consentStatus === 'bounced' ||
+            cTags.some((t: unknown) =>
+              ['unsubscribed', 'suppressed', 'bounced'].includes(normalizeTagToken(String(t || '')))
+            );
+          if (isUnsub) {
+            if (c.email) markRecipientGloballySuppressed(c.email);
+            if (c.phone) markRecipientGloballySuppressed(c.phone);
+          } else if (c.consentStatus === 'subscribed') {
+            if (c.email) removeRecipientFromGlobalSuppression(c.email);
+            if (c.phone) removeRecipientFromGlobalSuppression(c.phone);
+          }
         }
       }
 
@@ -1345,17 +1466,51 @@ async function startServer() {
     const cleanChannel: 'whatsapp' | 'email' | 'sms' =
       channel === 'email' || channel === 'sms' ? channel : 'whatsapp';
 
+    const cleanMessage = String(message || '').trim();
     const item = {
       id: `inb_wh_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
       channel: cleanChannel,
       leadName: String(leadName || 'Inbound Lead'),
       leadEmail: String(leadEmail || ''),
       leadPhone: String(leadPhone || ''),
-      message: String(message || ''),
+      message: cleanMessage,
       subject: String(subject || ''),
       listName: String(listName || 'General Contacts'),
       receivedAt: new Date().toISOString(),
     };
+
+    // Detect STOP / UNSUBSCRIBE / CANCEL opt-out keywords automatically
+    const normalizedKeyword = cleanMessage.toUpperCase().replace(/[^A-Z]/g, '');
+    const isOptOutKeyword =
+      /^(STOP|STOPALL|UNSUBSCRIBE|CANCEL|END|QUIT)$/i.test(cleanMessage.split(/\s+/)[0] || '') ||
+      ['STOP', 'UNSUBSCRIBE', 'STOPALL', 'OPTOUT'].includes(normalizedKeyword);
+
+    if (isOptOutKeyword) {
+      if (item.leadEmail) markRecipientGloballySuppressed(item.leadEmail);
+      if (item.leadPhone) markRecipientGloballySuppressed(item.leadPhone);
+      const unsubRecipient = item.leadEmail || item.leadPhone || item.leadName;
+      trackingComplianceQueue.unshift({
+        id: `trk_stop_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+        type: 'unsubscribe',
+        recipient: unsubRecipient,
+        reason: `Inbound ${cleanChannel.toUpperCase()} opt-out keyword ("${cleanMessage.slice(0, 32)}")`,
+        createdAt: new Date().toISOString(),
+      });
+      if (trackingComplianceQueue.length > 200) {
+        trackingComplianceQueue.pop();
+      }
+      // Immediately halt any queued scheduled jobs for this contact
+      for (const job of scheduledAutomationJobs) {
+        if (job.status !== 'queued') continue;
+        const killCheck = evaluateServerJobKillSwitch(job);
+        if (killCheck.halted) {
+          job.status = 'halted_kill_switch';
+          job.matchedKillSwitchTag = killCheck.matchedTag;
+          job.processedAt = new Date().toISOString();
+          job.statusReason = killCheck.reason;
+        }
+      }
+    }
 
     inboundWebhookQueue.unshift(item);
     if (inboundWebhookQueue.length > 50) {
@@ -1364,6 +1519,7 @@ async function startServer() {
 
     res.json({
       ok: true,
+      optOutTriggered: isOptOutKeyword,
       received: item,
     });
   });
@@ -1393,6 +1549,263 @@ async function startServer() {
     res.json({
       ok: true,
       remainingCount: inboundWebhookQueue.length,
+    });
+  });
+
+  // ==========================================================================
+  // 6. PUBLIC LEAD CAPTURE ENDPOINT (External HTML Forms & Public Shareable Pages)
+  // ==========================================================================
+  app.options('/api/leads/capture', (_req, res) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    res.sendStatus(204);
+  });
+
+  app.post('/api/leads/capture', (req, res) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+
+    const body = req.body || {};
+    const fullName = String(body.fullName || body.name || body.firstName || 'Website Lead').trim();
+    const email = String(body.email || body.leadEmail || '').trim();
+    const phone = String(body.phone || body.leadPhone || body.whatsapp || '').trim();
+    const company = String(body.company || body.organization || '').trim();
+    const assetId = String(body.assetId || req.query.assetId || 'external_embed').trim();
+    const assetName = String(body.assetName || req.query.assetName || 'External Lead Form').trim();
+    const targetList = String(body.targetList || body.listName || req.query.targetList || 'VIP Launches').trim();
+    const automationIdToTrigger = String(body.automationIdToTrigger || body.automationId || '').trim() || undefined;
+    const redirectUrl = String(body.redirectUrl || '').trim();
+
+    if (!email && !phone) {
+      res.status(400).json({
+        ok: false,
+        error: 'At least an email address or phone number is required.',
+      });
+      return;
+    }
+
+    const rawTags = Array.isArray(body.customTags)
+      ? body.customTags
+      : typeof body.customTags === 'string' && body.customTags.trim()
+      ? body.customTags.split(',')
+      : [];
+    const customTags = rawTags.map((t: unknown) => String(t || '').trim()).filter(Boolean);
+
+    const leadEvent: PublicLeadSubmissionEvent = {
+      id: `pub_lead_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+      assetId,
+      assetName,
+      targetList,
+      fullName,
+      email,
+      phone,
+      company,
+      customTags,
+      automationIdToTrigger,
+      createdAt: new Date().toISOString(),
+    };
+
+    publicLeadSubmissionsQueue.unshift(leadEvent);
+    if (publicLeadSubmissionsQueue.length > 100) {
+      publicLeadSubmissionsQueue.pop();
+    }
+
+    const acceptsHtml = String(req.headers.accept || '').includes('text/html');
+    const isFormUrlEncoded = String(req.headers['content-type'] || '').includes(
+      'application/x-www-form-urlencoded'
+    );
+    if (isFormUrlEncoded && acceptsHtml && redirectUrl && /^https?:\/\//i.test(redirectUrl)) {
+      res.redirect(302, redirectUrl);
+      return;
+    }
+
+    res.json({
+      ok: true,
+      lead: leadEvent,
+      message: `Lead captured into list "${targetList}" and queued for workflow dispatch.`,
+    });
+  });
+
+  app.get('/api/leads/capture', (req, res) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    const shouldConsume = String(req.query.consume || '').toLowerCase() === 'true';
+    const items = [...publicLeadSubmissionsQueue];
+    if (shouldConsume && publicLeadSubmissionsQueue.length > 0) {
+      publicLeadSubmissionsQueue.length = 0;
+    }
+    res.json({
+      ok: true,
+      items,
+    });
+  });
+
+  // ==========================================================================
+  // 7. LIVE EMAIL OPEN, LINK CLICK & ONE-CLICK UNSUBSCRIBE ENDPOINTS
+  // ==========================================================================
+  app.get('/api/track/open', (req, res) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    const campaignId = String(req.query.campaignId || '').trim() || undefined;
+    const automationId = String(req.query.automationId || '').trim() || undefined;
+    const recipient = String(req.query.recipient || req.query.to || 'lead@example.com').trim();
+
+    const event: TrackingComplianceEvent = {
+      id: `trk_open_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+      type: 'open',
+      campaignId,
+      automationId,
+      recipient,
+      createdAt: new Date().toISOString(),
+    };
+    trackingComplianceQueue.unshift(event);
+    if (trackingComplianceQueue.length > 200) {
+      trackingComplianceQueue.pop();
+    }
+
+    if (String(req.query.json || '').toLowerCase() === 'true') {
+      res.json({ ok: true, event });
+      return;
+    }
+
+    res.setHeader('Content-Type', 'image/gif');
+    res.send(TRANSPARENT_1X1_GIF);
+  });
+
+  app.get('/api/track/click', (req, res) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    const campaignId = String(req.query.campaignId || '').trim() || undefined;
+    const automationId = String(req.query.automationId || '').trim() || undefined;
+    const recipient = String(req.query.recipient || req.query.to || 'lead@example.com').trim();
+    const targetUrl = String(req.query.url || 'https://example.com').trim();
+
+    const event: TrackingComplianceEvent = {
+      id: `trk_click_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+      type: 'click',
+      campaignId,
+      automationId,
+      recipient,
+      targetUrl,
+      createdAt: new Date().toISOString(),
+    };
+    trackingComplianceQueue.unshift(event);
+    if (trackingComplianceQueue.length > 200) {
+      trackingComplianceQueue.pop();
+    }
+
+    if (String(req.query.json || '').toLowerCase() === 'true') {
+      res.json({ ok: true, event });
+      return;
+    }
+
+    const safeRedirect = /^https?:\/\//i.test(targetUrl) ? targetUrl : '/';
+    res.redirect(302, safeRedirect);
+  });
+
+  app.options('/api/unsubscribe', (_req, res) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    res.sendStatus(204);
+  });
+
+  const handleUnsubscribeRequest = (req: express.Request, res: express.Response) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    const rawRecipient = String(
+      req.body?.recipient ||
+        req.body?.email ||
+        req.body?.phone ||
+        req.query.recipient ||
+        req.query.email ||
+        req.query.phone ||
+        ''
+    ).trim();
+    const campaignId =
+      String(req.body?.campaignId || req.query.campaignId || '').trim() || undefined;
+    const automationId =
+      String(req.body?.automationId || req.query.automationId || '').trim() || undefined;
+    const reason =
+      String(req.body?.reason || req.query.reason || 'One-click unsubscribe link').trim();
+    const action = String(req.body?.action || req.query.action || 'unsubscribe')
+      .trim()
+      .toLowerCase();
+
+    if (!rawRecipient) {
+      res.status(400).json({ ok: false, error: 'Recipient email or phone is required.' });
+      return;
+    }
+
+    if (action === 'resubscribe') {
+      removeRecipientFromGlobalSuppression(rawRecipient);
+      const event: TrackingComplianceEvent = {
+        id: `trk_resub_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+        type: 'resubscribe',
+        campaignId,
+        automationId,
+        recipient: rawRecipient,
+        reason: 'Recipient re-subscribed',
+        createdAt: new Date().toISOString(),
+      };
+      trackingComplianceQueue.unshift(event);
+      res.json({
+        ok: true,
+        status: 'subscribed',
+        recipient: rawRecipient,
+        event,
+      });
+      return;
+    }
+
+    markRecipientGloballySuppressed(rawRecipient);
+    const event: TrackingComplianceEvent = {
+      id: `trk_unsub_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+      type: 'unsubscribe',
+      campaignId,
+      automationId,
+      recipient: rawRecipient,
+      reason,
+      createdAt: new Date().toISOString(),
+    };
+    trackingComplianceQueue.unshift(event);
+    if (trackingComplianceQueue.length > 200) {
+      trackingComplianceQueue.pop();
+    }
+
+    // Halt any queued automation jobs for this recipient immediately
+    for (const job of scheduledAutomationJobs) {
+      if (job.status !== 'queued') continue;
+      const killCheck = evaluateServerJobKillSwitch(job);
+      if (killCheck.halted) {
+        job.status = 'halted_kill_switch';
+        job.matchedKillSwitchTag = killCheck.matchedTag;
+        job.processedAt = new Date().toISOString();
+        job.statusReason = killCheck.reason;
+      }
+    }
+
+    res.json({
+      ok: true,
+      status: 'unsubscribed',
+      recipient: rawRecipient,
+      event,
+    });
+  };
+
+  app.post('/api/unsubscribe', handleUnsubscribeRequest);
+  app.get('/api/unsubscribe', handleUnsubscribeRequest);
+
+  app.get('/api/tracking/events', (req, res) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    const shouldConsume = String(req.query.consume || '').toLowerCase() === 'true';
+    const events = [...trackingComplianceQueue];
+    if (shouldConsume && trackingComplianceQueue.length > 0) {
+      trackingComplianceQueue.length = 0;
+    }
+    res.json({
+      ok: true,
+      events,
+      suppressedCount: globalSuppressedRecipients.size,
     });
   });
 

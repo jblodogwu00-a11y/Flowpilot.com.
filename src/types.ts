@@ -249,12 +249,14 @@ export interface UserMessagingIdentity {
   channel: ChannelType;
   label: string;
   value: string;
-  senderName: string;
+  senderName?: string;
+  displayName?: string;
   replyToEmail?: string;
-  providerMode: string;
-  isDefault: boolean;
+  providerMode?: string;
+  isDefault?: boolean;
+  isPrimary?: boolean;
   verified: boolean;
-  createdAt: string;
+  createdAt?: string;
 }
 
 export interface UserPrivateProfile {
@@ -268,9 +270,12 @@ export interface UserPrivateProfile {
   smsSenderId: string;
   emailProviderDomain: string;
   whatsappBusinessNumber?: string;
+  whatsappBusinessPhone?: string;
+  dailySendCap?: number;
   customDomainEmail?: string;
   useCustomDomainEmail?: boolean;
   messagingIdentitiesJson?: string;
+  savedIdentitiesJson?: string;
   gatewayConfigJson?: string;
   createdAt?: Timestamp | string;
   updatedAt?: Timestamp | string;
@@ -547,9 +552,12 @@ export function formatCurrency(amount: number, currency: CurrencyCode = 'USD'): 
 }
 
 export function parseUserMessagingIdentities(
-  privateProfile?: UserPrivateProfile
+  privateProfile?: UserPrivateProfile | string
 ): UserMessagingIdentity[] {
-  const raw = privateProfile?.messagingIdentitiesJson;
+  const raw =
+    typeof privateProfile === 'string'
+      ? privateProfile
+      : privateProfile?.messagingIdentitiesJson || privateProfile?.savedIdentitiesJson;
   if (!raw) return [];
   try {
     const parsed = JSON.parse(raw);
@@ -563,22 +571,35 @@ export function parseUserMessagingIdentities(
           typeof item.value === 'string' &&
           item.value.trim().length > 0
       )
-      .map((item) => ({
-        id: String(item.id || generateSafeId(`id_${item.channel}`)),
-        channel: item.channel as ChannelType,
-        label: String(item.label || 'Primary Identity').slice(0, 80),
-        value: String(item.value).trim().slice(0, 150),
-        senderName: String(item.senderName || 'Workspace Operator').slice(0, 100),
-        replyToEmail: item.replyToEmail ? String(item.replyToEmail).trim().slice(0, 150) : undefined,
-        providerMode: String(item.providerMode || 'builtin_relay').slice(0, 40),
-        isDefault: Boolean(item.isDefault),
-        verified: item.verified !== undefined ? Boolean(item.verified) : true,
-        createdAt: String(item.createdAt || new Date().toISOString()),
-      }));
+      .map((item) => {
+        const nameLabel = String(item.senderName || item.displayName || 'Workspace Operator').slice(
+          0,
+          100
+        );
+        const isDef = Boolean(item.isDefault || item.isPrimary);
+        return {
+          id: String(item.id || generateSafeId(`id_${item.channel}`)),
+          channel: item.channel as ChannelType,
+          label: String(item.label || 'Primary Identity').slice(0, 80),
+          value: String(item.value).trim().slice(0, 150),
+          senderName: nameLabel,
+          displayName: nameLabel,
+          replyToEmail: item.replyToEmail
+            ? String(item.replyToEmail).trim().slice(0, 150)
+            : undefined,
+          providerMode: String(item.providerMode || 'builtin_relay').slice(0, 40),
+          isDefault: isDef,
+          isPrimary: isDef,
+          verified: item.verified !== undefined ? Boolean(item.verified) : true,
+          createdAt: String(item.createdAt || new Date().toISOString()),
+        };
+      });
   } catch {
     return [];
   }
 }
+
+export const parseSavedMessagingIdentities = parseUserMessagingIdentities;
 
 export function serializeUserMessagingIdentities(
   identities: UserMessagingIdentity[]
@@ -615,6 +636,7 @@ export interface ResolvedSenderIdentities {
   emailDisplaySender: string;
   smsSenderId: string;
   savedIdentities: UserMessagingIdentity[];
+  allIdentities: UserMessagingIdentity[];
   whatsappIdentities: UserMessagingIdentity[];
   emailIdentities: UserMessagingIdentity[];
   smsIdentities: UserMessagingIdentity[];
@@ -717,6 +739,7 @@ export function resolveWorkspaceSenderIdentities(
     emailDisplaySender,
     smsSenderId,
     savedIdentities: parsedIdentities,
+    allIdentities: parsedIdentities,
     whatsappIdentities,
     emailIdentities,
     smsIdentities,

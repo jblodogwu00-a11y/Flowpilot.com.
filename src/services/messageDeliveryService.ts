@@ -429,6 +429,56 @@ export function buildDirectChannelUrl(
   return `sms:+${digits}?body=${encodeURIComponent(body)}`;
 }
 
+export function buildOneClickUnsubscribeUrl(
+  recipient: string,
+  campaignId?: string,
+  automationId?: string
+): string {
+  const origin =
+    typeof window !== 'undefined' && window.location?.origin
+      ? window.location.origin
+      : 'https://flowpilot.app';
+  const params = new URLSearchParams();
+  params.set('unsubscribe', (recipient || 'lead@example.com').trim());
+  if (campaignId) params.set('campaignId', campaignId);
+  if (automationId) params.set('automationId', automationId);
+  return `${origin}/?${params.toString()}`;
+}
+
+export function buildLiveOpenPixelUrl(
+  recipient: string,
+  campaignId?: string,
+  automationId?: string
+): string {
+  const origin =
+    typeof window !== 'undefined' && window.location?.origin
+      ? window.location.origin
+      : 'https://flowpilot.app';
+  const params = new URLSearchParams();
+  params.set('recipient', (recipient || 'lead@example.com').trim());
+  if (campaignId) params.set('campaignId', campaignId);
+  if (automationId) params.set('automationId', automationId);
+  return `${origin}/api/track/open?${params.toString()}`;
+}
+
+export function buildLiveClickTrackingUrl(
+  targetUrl: string,
+  recipient: string,
+  campaignId?: string,
+  automationId?: string
+): string {
+  const origin =
+    typeof window !== 'undefined' && window.location?.origin
+      ? window.location.origin
+      : 'https://flowpilot.app';
+  const params = new URLSearchParams();
+  params.set('url', (targetUrl || 'https://example.com').trim());
+  params.set('recipient', (recipient || 'lead@example.com').trim());
+  if (campaignId) params.set('campaignId', campaignId);
+  if (automationId) params.set('automationId', automationId);
+  return `${origin}/api/track/click?${params.toString()}`;
+}
+
 export function personalizeAutomationMessage(
   template: string,
   context: {
@@ -438,10 +488,18 @@ export function personalizeAutomationMessage(
     company?: string;
     listName?: string;
     senderName?: string;
+    campaignId?: string;
+    automationId?: string;
   }
 ): string {
   const full = (context.fullName || 'Valued Lead').trim();
   const first = full.split(/\s+/)[0] || 'there';
+  const recipientKey = context.email || context.phone || 'lead@example.com';
+  const unsubUrl = buildOneClickUnsubscribeUrl(
+    recipientKey,
+    context.campaignId,
+    context.automationId
+  );
   return (template || '')
     .replace(/\{\{\s*first_name\s*\}\}/gi, first)
     .replace(/\{\{\s*full_name\s*\}\}/gi, full)
@@ -450,7 +508,8 @@ export function personalizeAutomationMessage(
     .replace(/\{\{\s*phone\s*\}\}/gi, context.phone || '+1 (555) 234-8910')
     .replace(/\{\{\s*company\s*\}\}/gi, context.company || 'your organization')
     .replace(/\{\{\s*list_name\s*\}\}/gi, context.listName || 'VIP List')
-    .replace(/\{\{\s*sender_name\s*\}\}/gi, context.senderName || 'FlowPilot Team');
+    .replace(/\{\{\s*sender_name\s*\}\}/gi, context.senderName || 'FlowPilot Team')
+    .replace(/\{\{\s*unsubscribe_url\s*\}\}/gi, unsubUrl);
 }
 
 export async function fetchGatewayStatus(): Promise<MultiChannelGatewayStatus> {
@@ -755,6 +814,7 @@ export async function syncKillSwitchWithServerScheduler(params: {
     phone?: string;
     fullName?: string;
     listName?: string;
+    consentStatus?: string;
     tags: string[];
   }>;
   lists?: Array<{
@@ -890,4 +950,200 @@ export async function pollAndConsumeInboundWebhooks(): Promise<InboundWebhookPay
     // Ignore polling error if offline
   }
   return [];
+}
+
+export interface PublicLeadCaptureEventItem {
+  id: string;
+  assetId: string;
+  assetSlug: string;
+  assetName: string;
+  targetList: string;
+  fullName: string;
+  email: string;
+  phone: string;
+  company: string;
+  tags: string[];
+  customTags: string[];
+  customFields: string[];
+  notes?: string;
+  automationIdToTrigger?: string;
+  createdAt: string;
+}
+
+export async function submitPublicLeadCapture(payload: {
+  assetId?: string;
+  assetSlug?: string;
+  assetName?: string;
+  targetList: string;
+  fullName: string;
+  email: string;
+  phone: string;
+  company?: string;
+  tags?: string[];
+  customTags?: string[];
+  customFields?: string[];
+  redirectUrl?: string;
+  automationIdToTrigger?: string;
+}): Promise<{ ok: boolean; lead?: PublicLeadCaptureEventItem }> {
+  try {
+    const res = await fetch('/api/leads/capture', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      return { ok: true, lead: data?.lead };
+    }
+  } catch {
+    // Ignore network error
+  }
+  return { ok: false };
+}
+
+export const submitPublicLeadToCaptureWebhook = submitPublicLeadCapture;
+
+export async function pollAndConsumePublicLeads(): Promise<PublicLeadCaptureEventItem[]> {
+  try {
+    const res = await fetch('/api/leads/capture?consume=true');
+    if (res.ok) {
+      const data = await res.json();
+      const rawItems = Array.isArray(data?.items)
+        ? data.items
+        : Array.isArray(data?.submissions)
+        ? data.submissions
+        : [];
+      if (rawItems.length > 0) {
+        return rawItems.map((it: Record<string, unknown>) => ({
+          id: String(it.id || ''),
+          assetId: String(it.assetId || it.assetSlug || ''),
+          assetSlug: String(it.assetSlug || it.assetId || ''),
+          assetName: String(it.assetName || it.assetSlug || ''),
+          targetList: String(it.targetList || 'General Contacts'),
+          fullName: String(it.fullName || 'Captured Lead'),
+          email: String(it.email || ''),
+          phone: String(it.phone || ''),
+          company: String(it.company || ''),
+          tags: Array.isArray(it.tags)
+            ? (it.tags as string[])
+            : Array.isArray(it.customTags)
+            ? (it.customTags as string[])
+            : [],
+          customTags: Array.isArray(it.customTags)
+            ? (it.customTags as string[])
+            : Array.isArray(it.tags)
+            ? (it.tags as string[])
+            : [],
+          customFields: Array.isArray(it.customFields) ? (it.customFields as string[]) : [],
+          notes: typeof it.notes === 'string' ? it.notes : undefined,
+          createdAt: String(it.createdAt || it.submittedAt || new Date().toISOString()),
+        }));
+      }
+    }
+  } catch {
+    // Ignore polling error if offline
+  }
+  return [];
+}
+
+export const pollAndConsumePublicLeadCaptures = pollAndConsumePublicLeads;
+
+export interface TrackingComplianceEventItem {
+  id: string;
+  type: 'open' | 'click' | 'unsubscribe' | 'resubscribe';
+  eventType: 'open' | 'click' | 'unsubscribe' | 'resubscribe';
+  campaignId?: string;
+  automationId?: string;
+  recipient: string;
+  targetUrl?: string;
+  reason?: string;
+  createdAt: string;
+}
+
+export async function pollAndConsumeTrackingEvents(): Promise<TrackingComplianceEventItem[]> {
+  try {
+    const res = await fetch('/api/track/events?consume=true');
+    if (res.ok) {
+      const data = await res.json();
+      const rawEvents = Array.isArray(data?.events)
+        ? data.events
+        : Array.isArray(data?.items)
+        ? data.items
+        : [];
+      if (rawEvents.length > 0) {
+        return rawEvents.map((ev: Record<string, unknown>) => {
+          const evType = (ev.eventType || ev.type || 'open') as
+            | 'open'
+            | 'click'
+            | 'unsubscribe'
+            | 'resubscribe';
+          return {
+            id: String(ev.id || ''),
+            type: evType,
+            eventType: evType,
+            campaignId: ev.campaignId ? String(ev.campaignId) : undefined,
+            automationId: ev.automationId ? String(ev.automationId) : undefined,
+            recipient: String(ev.recipient || ''),
+            targetUrl: ev.targetUrl ? String(ev.targetUrl) : undefined,
+            reason: ev.reason ? String(ev.reason) : undefined,
+            createdAt: String(ev.createdAt || new Date().toISOString()),
+          };
+        });
+      }
+    }
+  } catch {
+    // Ignore polling error if offline
+  }
+  return [];
+}
+
+export const pollAndConsumeTrackingComplianceEvents = pollAndConsumeTrackingEvents;
+
+export async function triggerOneClickUnsubscribe(params: {
+  recipient: string;
+  campaignId?: string;
+  automationId?: string;
+  reason?: string;
+  action?: 'unsubscribe' | 'resubscribe';
+}): Promise<{ ok: boolean; status: string }> {
+  try {
+    const res = await fetch('/api/unsubscribe', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(params),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      return { ok: true, status: data?.status || 'unsubscribed' };
+    }
+  } catch {
+    // Ignore network error
+  }
+  return { ok: false, status: 'error' };
+}
+
+export async function triggerLiveTrackingTestEvent(params: {
+  type: 'open' | 'click';
+  recipient: string;
+  campaignId?: string;
+  automationId?: string;
+  targetUrl?: string;
+}): Promise<boolean> {
+  try {
+    const query = new URLSearchParams();
+    query.set('recipient', params.recipient || 'lead@example.com');
+    query.set('json', 'true');
+    if (params.campaignId) query.set('campaignId', params.campaignId);
+    if (params.automationId) query.set('automationId', params.automationId);
+    if (params.type === 'click') {
+      query.set('url', params.targetUrl || 'https://flowpilot.app/offer');
+      const res = await fetch(`/api/track/click?${query.toString()}`);
+      return res.ok;
+    } else {
+      const res = await fetch(`/api/track/open?${query.toString()}`);
+      return res.ok;
+    }
+  } catch {
+    return false;
+  }
 }

@@ -3266,16 +3266,32 @@ export const CaptureAssetsView: React.FC<CaptureAssetsViewProps> = ({
           </div>
 
           <div className="lg:col-span-6 border border-slate-200 rounded-2xl bg-white p-5 space-y-4 shadow-xs">
-            <div className="flex items-center justify-between">
+            <div className="flex items-center justify-between gap-2">
               <h3 className="font-display text-base font-bold text-slate-950">
-                Copy-Paste HTML / JS Embed Snippet
+                Copy-Paste HTML Form &amp; Iframe Embed Snippet
               </h3>
               <button
                 type="button"
                 onClick={() => {
-                  const snippet = `<iframe src="https://${activeBuilderMeta.customDomain}/p/${activeBuilderAsset.slug}?embed=true" width="100%" height="520" style="border:0;border-radius:16px;" loading="lazy"></iframe>`;
+                  const originUrl =
+                    typeof window !== 'undefined' && window.location?.origin
+                      ? window.location.origin
+                      : `https://${activeBuilderMeta.customDomain}`;
+                  const snippet = `<!-- FlowPilot Direct Webhook Form (${activeBuilderAsset.title}) -->
+<form action="${originUrl}/api/leads/capture" method="POST" style="max-width:480px;font-family:sans-serif;">
+  <input type="hidden" name="assetSlug" value="${activeBuilderAsset.slug}" />
+  <input type="hidden" name="targetList" value="${activeBuilderAsset.targetList}" />
+  <input type="hidden" name="tags" value="${activeBuilderMeta.submissionTags.join(',')}" />
+  <input type="hidden" name="redirectUrl" value="${activeBuilderAsset.redirectUrl || ''}" />
+  <input type="text" name="fullName" placeholder="Full Name" required style="width:100%;padding:10px;margin-bottom:8px;" />
+  <input type="email" name="email" placeholder="Email Address" required style="width:100%;padding:10px;margin-bottom:8px;" />
+  <input type="tel" name="phone" placeholder="WhatsApp / Mobile Number" style="width:100%;padding:10px;margin-bottom:12px;" />
+  <button type="submit" style="width:100%;padding:12px;background:#047857;color:#fff;border:0;border-radius:8px;font-weight:bold;">${activeBuilderAsset.ctaText}</button>
+</form>
+<!-- Or Responsive Iframe Embed -->
+<iframe src="${originUrl}/?capture=${activeBuilderAsset.slug}" width="100%" height="520" style="border:0;border-radius:16px;" loading="lazy"></iframe>`;
                   navigator.clipboard?.writeText(snippet);
-                  setStatusBanner('Copied HTML embed snippet to clipboard.');
+                  setStatusBanner('Copied live HTML POST form & iframe embed snippet to clipboard.');
                 }}
                 className="px-3 py-1.5 text-xs font-bold text-emerald-800 bg-emerald-50 border border-emerald-200 rounded-lg cursor-pointer"
               >
@@ -3284,13 +3300,29 @@ export const CaptureAssetsView: React.FC<CaptureAssetsViewProps> = ({
             </div>
 
             <pre className="p-4 rounded-xl bg-[#0F172A] text-emerald-300 font-mono text-[11px] overflow-x-auto leading-relaxed">
-{`<!-- FlowPilot No-Code Lead Capture Widget (${activeBuilderAsset.title}) -->
-<div id="fp-capture-${activeBuilderAsset.slug}"
-     data-list="${activeBuilderAsset.targetList}"
-     data-trigger="${activeBuilderMeta.popupTrigger}"
-     data-tags="${activeBuilderMeta.submissionTags.join(',')}"></div>
+{`<!-- FlowPilot Direct Webhook Form (${activeBuilderAsset.title}) -->
+<form action="${
+  typeof window !== 'undefined' && window.location?.origin
+    ? window.location.origin
+    : `https://${activeBuilderMeta.customDomain}`
+}/api/leads/capture" method="POST">
+  <input type="hidden" name="assetSlug" value="${activeBuilderAsset.slug}" />
+  <input type="hidden" name="targetList" value="${activeBuilderAsset.targetList}" />
+  <input type="hidden" name="tags" value="${activeBuilderMeta.submissionTags.join(',')}" />
+  <input type="hidden" name="redirectUrl" value="${activeBuilderAsset.redirectUrl || ''}" />
+  <input type="text" name="fullName" placeholder="Full Name" required />
+  <input type="email" name="email" placeholder="Email Address" required />
+  <input type="tel" name="phone" placeholder="WhatsApp / Mobile Number" />
+  <button type="submit">${activeBuilderAsset.ctaText}</button>
+</form>
+
+<!-- Or Standalone Shareable / Iframe Embed -->
 <iframe
-  src="https://${activeBuilderMeta.customDomain}/p/${activeBuilderAsset.slug}?embed=1"
+  src="${
+    typeof window !== 'undefined' && window.location?.origin
+      ? window.location.origin
+      : `https://${activeBuilderMeta.customDomain}`
+  }/?capture=${activeBuilderAsset.slug}"
   width="100%"
   height="520"
   style="border:none;border-radius:16px;max-width:640px;"

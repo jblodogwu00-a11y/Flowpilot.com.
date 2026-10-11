@@ -51,6 +51,8 @@ import {
   Workspace,
   UserPrivateProfile,
   ChannelType,
+  UserMessagingIdentity,
+  parseSavedMessagingIdentities,
   sanitizeString,
   resolveWorkspaceSenderIdentities,
 } from '../types';
@@ -276,6 +278,49 @@ export const AutomationsView: React.FC<AutomationsViewProps> = ({
   const [msgSpecificDateTime, setMsgSpecificDateTime] = useState<string>('2026-10-15T09:00');
   const [msgBusinessDaysOnly, setMsgBusinessDaysOnly] = useState<boolean>(true);
   const [msgBranchPath, setMsgBranchPath] = useState<BranchPathType>('main');
+
+  const getSavedIdentitiesForChannel = (ch: ChannelType): UserMessagingIdentity[] => {
+    const saved = parseSavedMessagingIdentities(privateProfile?.savedIdentitiesJson);
+    const matching = saved.filter((item) => item.channel === ch);
+    if (matching.length > 0) return matching;
+    if (ch === 'whatsapp') {
+      return [
+        {
+          id: 'default_wa_primary',
+          channel: 'whatsapp',
+          label: 'Primary WhatsApp Business',
+          value: senderIdentities.whatsappBusinessNumber,
+          displayName: workspace?.senderName || 'FlowPilot Operator',
+          isPrimary: true,
+          verified: true,
+        },
+      ];
+    }
+    if (ch === 'sms') {
+      return [
+        {
+          id: 'default_sms_primary',
+          channel: 'sms',
+          label: 'Primary SMS Sender ID',
+          value: senderIdentities.smsSenderId,
+          displayName: workspace?.senderName || 'FlowPilot Operator',
+          isPrimary: true,
+          verified: true,
+        },
+      ];
+    }
+    return [
+      {
+        id: 'default_email_primary',
+        channel: 'email',
+        label: 'Primary Sender Email',
+        value: senderIdentities.activeSenderEmail,
+        displayName: workspace?.senderName || 'FlowPilot Operator',
+        isPrimary: true,
+        verified: true,
+      },
+    ];
+  };
 
   // Live 1-second ticker for jobs held in waiting_delay state
   useEffect(() => {
@@ -1212,6 +1257,7 @@ export const AutomationsView: React.FC<AutomationsViewProps> = ({
             company: contactCompany,
             listName: contactListName,
             senderName: workspace?.senderName || workspace?.name,
+            automationId: activeWorkflow.id,
           });
 
           const personalizedBody = personalizeAutomationMessage(rawBody, {
@@ -1221,6 +1267,7 @@ export const AutomationsView: React.FC<AutomationsViewProps> = ({
             company: contactCompany,
             listName: contactListName,
             senderName: workspace?.senderName || workspace?.name,
+            automationId: activeWorkflow.id,
           });
 
           const stepRecipient = stepChannel === 'email' ? contactEmail : contactPhone;
@@ -1233,6 +1280,7 @@ export const AutomationsView: React.FC<AutomationsViewProps> = ({
             body: personalizedBody,
             listName: contactListName,
             source: 'automation_workflow',
+            overrideFromIdentity: node.config.overrideFromIdentity,
             workspace,
             privateProfile,
           });
@@ -3309,6 +3357,55 @@ export const AutomationsView: React.FC<AutomationsViewProps> = ({
                                 </div>
                               )}
                               <div>
+                                <label className="block text-xs font-bold uppercase tracking-wider text-slate-600 mb-1">
+                                  Send From Identity (
+                                  {selectedNode.subType === 'send_whatsapp'
+                                    ? 'WHATSAPP'
+                                    : selectedNode.subType === 'send_sms'
+                                    ? 'SMS'
+                                    : 'EMAIL'}
+                                  )
+                                </label>
+                                {(() => {
+                                  const nodeCh: ChannelType =
+                                    selectedNode.subType === 'send_whatsapp'
+                                      ? 'whatsapp'
+                                      : selectedNode.subType === 'send_sms'
+                                      ? 'sms'
+                                      : 'email';
+                                  const identOptions = getSavedIdentitiesForChannel(nodeCh);
+                                  const currentVal =
+                                    selectedNode.config.overrideFromIdentity ||
+                                    identOptions.find((i) => i.isPrimary)?.value ||
+                                    identOptions[0]?.value ||
+                                    '';
+                                  return (
+                                    <select
+                                      value={currentVal}
+                                      onChange={(e) => {
+                                        const chosenVal = e.target.value;
+                                        const matchedIdent = identOptions.find(
+                                          (i) => i.value === chosenVal
+                                        );
+                                        handleUpdateSelectedNode(
+                                          {},
+                                          {
+                                            overrideFromIdentity: chosenVal,
+                                            senderIdentityId: matchedIdent?.id,
+                                          }
+                                        );
+                                      }}
+                                      className="w-full px-3.5 py-2 text-xs font-mono font-semibold bg-slate-50 border border-slate-200 rounded-xl text-[#0F172A] mb-2.5"
+                                    >
+                                      {identOptions.map((ident) => (
+                                        <option key={ident.id} value={ident.value}>
+                                          {ident.label}: {ident.value}{' '}
+                                          {ident.isPrimary ? '(Primary)' : ''}
+                                        </option>
+                                      ))}
+                                    </select>
+                                  );
+                                })()}
                                 <label className="block text-xs font-bold uppercase tracking-wider text-slate-600 mb-1">
                                   {selectedNode.subType === 'send_whatsapp'
                                     ? 'Official WhatsApp Template Name'
