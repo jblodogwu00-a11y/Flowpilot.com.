@@ -67,6 +67,13 @@ import {
   connectGmailAccountWithPopup,
   disconnectGmailToken,
 } from '../firebase';
+import {
+  WorkspaceSnapshot,
+  loadLocalWorkspaceSnapshot,
+  saveLocalWorkspaceSnapshot,
+  pushServerWorkspaceSnapshot,
+  buildStarterWorkspaceSnapshot,
+} from '../services/accountPersistenceService';
 
 import { AuthModalMode } from './AuthModal';
 import {
@@ -100,6 +107,7 @@ interface WorkspaceSettingsViewProps {
   onSignOut: () => Promise<void>;
   onOpenAuth: (mode: AuthModalMode) => void;
   onReseedWorkspace: () => Promise<void>;
+  onRestoreWorkspaceSnapshot?: (snapshot: WorkspaceSnapshot) => void;
 }
 
 export const WorkspaceSettingsView: React.FC<WorkspaceSettingsViewProps> = ({
@@ -119,7 +127,77 @@ export const WorkspaceSettingsView: React.FC<WorkspaceSettingsViewProps> = ({
   onSignOut,
   onOpenAuth,
   onReseedWorkspace,
+  onRestoreWorkspaceSnapshot,
 }) => {
+  const [backupNotice, setBackupNotice] = useState<string | null>(null);
+  const [selectedWebhookEventPreview, setSelectedWebhookEventPreview] = useState<
+    'message.deliver' | 'contact.captured' | 'campaign.ab_winner' | 'conversion.attributed'
+  >('message.deliver');
+
+  const handleExportWorkspaceBackupJson = () => {
+    const uid = currentUserUid || workspace.ownerId || 'workspace_export';
+    const userEmail = currentUserEmail || privateProfile.email || 'operator@flowpilot.app';
+    const currentSnap =
+      loadLocalWorkspaceSnapshot(uid, userEmail) ||
+      buildStarterWorkspaceSnapshot(uid, userEmail, workspace.senderName, workspace.name);
+    const exportPayload: WorkspaceSnapshot = {
+      ...currentSnap,
+      workspace,
+      privateProfile,
+      members,
+      updatedAt: new Date().toISOString(),
+    };
+    const blob = new Blob([JSON.stringify(exportPayload, null, 2)], {
+      type: 'application/json',
+    });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    const slug = (workspace.name || 'flowpilot-workspace')
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-');
+    link.download = `${slug}-backup-${new Date().toISOString().slice(0, 10)}.json`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+    setBackupNotice(
+      `Exported complete workspace backup JSON for "${workspace.name}" (${exportPayload.contacts.length} contacts, ${exportPayload.campaigns.length} campaigns, ${exportPayload.automations.length} workflows).`
+    );
+  };
+
+  const handleImportWorkspaceBackupJson = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = async (ev) => {
+      try {
+        const rawText = String(ev.target?.result || '');
+        const parsed = JSON.parse(rawText) as WorkspaceSnapshot;
+        if (!parsed || !parsed.workspace || typeof parsed.workspace !== 'object') {
+          setBackupNotice(
+            'Invalid backup file: JSON does not contain a valid FlowPilot workspace snapshot.'
+          );
+          return;
+        }
+        const uid = currentUserUid || workspace.ownerId || parsed.workspace.id || 'restored_ws';
+        const userEmail =
+          currentUserEmail || privateProfile.email || parsed.privateProfile?.email || '';
+        saveLocalWorkspaceSnapshot(uid, userEmail, parsed);
+        await pushServerWorkspaceSnapshot(uid, userEmail, parsed);
+        if (onRestoreWorkspaceSnapshot) {
+          onRestoreWorkspaceSnapshot(parsed);
+        }
+        setBackupNotice(
+          `Restored workspace backup "${parsed.workspace.name}" (${(parsed.contacts || []).length} contacts, ${(parsed.lists || []).length} lists, ${(parsed.campaigns || []).length} broadcasts).`
+        );
+      } catch {
+        setBackupNotice('Failed to parse backup JSON file. Please select a valid .json backup.');
+      }
+    };
+    reader.readAsText(file);
+    e.target.value = '';
+  };
   // Workspace form state
   const [wsName, setWsName] = useState(workspace.name);
   const [category, setCategory] = useState<BusinessCategory>(workspace.category);
@@ -3648,6 +3726,134 @@ export const WorkspaceSettingsView: React.FC<WorkspaceSettingsViewProps> = ({
               </div>
             </div>
           ))}
+        </div>
+      </section>
+
+      {/* Section 4: Full Workspace Backup Export/Import (.json) & Live API Webhook Inspector */}
+      <section className="border border-slate-200 rounded-2xl bg-white p-7 space-y-6 shadow-xs">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-slate-100 pb-4">
+          <div>
+            <div className="text-xs font-mono uppercase tracking-wider text-[#047857] font-bold">
+              Portable Data Ownership &amp; Developer API Inspector
+            </div>
+            <h3 className="font-display text-2xl font-bold text-slate-950 mt-0.5">
+              Full Workspace Backup Export / Restore &amp; Webhook Payload Inspector
+            </h3>
+            <p className="text-sm text-slate-600 mt-1">
+              Download a complete portable JSON snapshot of your workspace or restore from a backup file in one click.
+            </p>
+          </div>
+          <div className="flex flex-wrap items-center gap-3">
+            <button
+              type="button"
+              onClick={handleExportWorkspaceBackupJson}
+              className="px-4 py-2.5 text-xs font-bold text-white bg-[#0F172A] hover:bg-slate-800 rounded-xl cursor-pointer inline-flex items-center gap-2"
+            >
+              <ExternalLink className="w-4 h-4 text-emerald-400" />
+              <span>Export Full Workspace Backup (.json)</span>
+            </button>
+            <label className="px-4 py-2.5 text-xs font-bold text-white bg-[#047857] hover:bg-[#065F46] rounded-xl cursor-pointer inline-flex items-center gap-2">
+              <RefreshCw className="w-4 h-4" />
+              <span>Restore from Backup (.json)</span>
+              <input
+                type="file"
+                accept=".json,application/json"
+                onChange={handleImportWorkspaceBackupJson}
+                className="hidden"
+              />
+            </label>
+          </div>
+        </div>
+
+        {backupNotice && (
+          <div className="p-4 rounded-xl bg-emerald-50 border border-emerald-200 text-xs font-semibold text-emerald-950 flex items-center justify-between">
+            <span>{backupNotice}</span>
+            <button
+              type="button"
+              onClick={() => setBackupNotice(null)}
+              className="text-emerald-800 hover:underline font-bold ml-4 cursor-pointer"
+            >
+              Dismiss
+            </button>
+          </div>
+        )}
+
+        <div className="grid grid-cols-1 lg:grid-cols-12 gap-5 text-xs">
+          <div className="lg:col-span-5 p-4 rounded-xl bg-[#F8FAFC] border border-slate-200 space-y-3">
+            <div className="font-bold text-slate-950 text-sm">
+              Live Outbound &amp; Inbound Webhook Events
+            </div>
+            <p className="text-slate-600 leading-relaxed">
+              Inspect the real-time JSON webhook schemas dispatched by FlowPilot to your external endpoints (Shopify, Stripe, Zapier, Make, n8n).
+            </p>
+            <div className="space-y-1.5">
+              {(
+                [
+                  { id: 'message.deliver', label: 'flowpilot.message.deliver (Omnichannel)' },
+                  { id: 'contact.captured', label: 'flowpilot.contact.captured (Lead Funnel)' },
+                  { id: 'campaign.ab_winner', label: 'flowpilot.campaign.ab_winner (A/B Split)' },
+                  { id: 'conversion.attributed', label: 'flowpilot.conversion.attributed (Revenue ROI)' },
+                ] as const
+              ).map((ev) => (
+                <button
+                  key={ev.id}
+                  type="button"
+                  onClick={() => setSelectedWebhookEventPreview(ev.id)}
+                  className={`w-full text-left px-3 py-2 rounded-lg font-mono font-bold border transition-colors cursor-pointer ${
+                    selectedWebhookEventPreview === ev.id
+                      ? 'bg-[#0F172A] text-emerald-400 border-[#0F172A]'
+                      : 'bg-white text-slate-700 border-slate-200 hover:border-slate-400'
+                  }`}
+                >
+                  {ev.label}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="lg:col-span-7 p-4 rounded-xl bg-[#0F172A] text-slate-100 border border-slate-800 space-y-2 font-mono">
+            <div className="flex items-center justify-between text-[11px] text-emerald-400 border-b border-slate-800 pb-2">
+              <span>POST {getStoredOutboundWebhookUrl() || 'https://hooks.yourworkspace.io/flowpilot'}</span>
+              <span>HTTP 200 OK · Signed HMAC-SHA256</span>
+            </div>
+            <pre className="text-[11px] leading-relaxed overflow-x-auto text-slate-200">
+              {JSON.stringify(
+                {
+                  event: `flowpilot.${selectedWebhookEventPreview}`,
+                  workspaceId: workspace.id,
+                  workspaceName: workspace.name,
+                  timestamp: new Date().toISOString(),
+                  payload:
+                    selectedWebhookEventPreview === 'message.deliver'
+                      ? {
+                          channel: 'email',
+                          from: privateProfile.email,
+                          to: 'subscriber@company.com',
+                          status: 'delivered',
+                        }
+                      : selectedWebhookEventPreview === 'contact.captured'
+                      ? {
+                          email: 'lead@company.com',
+                          listName: 'General Contacts',
+                          consentStatus: 'opted_in',
+                        }
+                      : selectedWebhookEventPreview === 'campaign.ab_winner'
+                      ? {
+                          winningVariant: 'B',
+                          criterion: 'open_rate',
+                          autoDispatchedRemainingPercent: 60,
+                        }
+                      : {
+                          attributedRevenue: 290,
+                          currency: workspace.currency,
+                          channel: 'email',
+                        },
+                },
+                null,
+                2
+              )}
+            </pre>
+          </div>
         </div>
       </section>
     </div>

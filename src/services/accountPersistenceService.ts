@@ -14,6 +14,7 @@ import {
   ActivityLog,
   generateSafeId,
 } from '../types';
+import { getStoredChannelGatewayConfig } from './messageDeliveryService';
 
 export interface WorkspaceSnapshot {
   workspace: Workspace;
@@ -42,15 +43,28 @@ export interface ActiveAccountSession {
   isFirebaseUser: boolean;
 }
 
+/**
+ * Sanitized metadata confirming that the verification email was dispatched
+ * to the user's email address. Never contains the 6-digit code or email body.
+ */
 export interface VerificationEmailDispatchInfo {
   to: string;
   subject: string;
-  body: string;
-  code: string;
   providerUsed: string;
   status: string;
-  directLaunchUrl?: string;
   sentAt: string;
+}
+
+export interface VerificationEmailConnectorOverride {
+  providerMode?: 'builtin_relay' | 'gmail_oauth' | 'resend_api' | 'sendgrid_api' | 'smtp';
+  resendApiKey?: string;
+  sendgridApiKey?: string;
+  smtpHost?: string;
+  smtpPort?: number | string;
+  smtpUser?: string;
+  smtpPass?: string;
+  fromEmail?: string;
+  fromName?: string;
 }
 
 const ACTIVE_SESSION_KEY = 'fp_active_account_session_v1';
@@ -65,7 +79,6 @@ interface LocalRegistryAccount {
   password: string;
   provider: 'password' | 'google.com';
   emailVerified: boolean;
-  pendingVerificationCode?: string;
   createdAt: string;
 }
 
@@ -351,6 +364,8 @@ export async function syncAccountWithServer(params: {
   code?: string;
   firebaseVerified?: boolean;
   isFirebaseUser?: boolean;
+  gmailAccessToken?: string;
+  emailConnector?: VerificationEmailConnectorOverride;
 }): Promise<{
   account: ActiveAccountSession;
   snapshot: WorkspaceSnapshot | null;
@@ -361,341 +376,177 @@ export async function syncAccountWithServer(params: {
   const cleanEmail = params.email.trim().toLowerCase();
   const registry = getLocalAccountsRegistry();
   const localExisting = registry[cleanEmail];
+  const storedGateway = getStoredChannelGatewayConfig();
 
-  try {
-    const res = await fetch('/api/accounts/auth', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        action: params.action,
-        email: cleanEmail,
-        password: params.password,
-        newPassword: params.newPassword,
-        fullName: params.fullName,
-        workspaceName: params.workspaceName,
-        uid: params.uid || localExisting?.uid,
-        code: params.code,
-        expectedCodeFallback: localExisting?.pendingVerificationCode,
-        firebaseVerified: params.firebaseVerified,
-        localVerifiedAccount: Boolean(localExisting?.emailVerified),
-      }),
-    });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok || data?.ok === false) {
-      throw new Error(
-        data?.error || 'Authentication failed. Please check your credentials.'
-      );
-    }
+  const effectiveEmailConnector: VerificationEmailConnectorOverride = {
+    providerMode:
+      params.emailConnector?.providerMode || storedGateway.email.providerMode,
+    resendApiKey:
+      params.emailConnector?.resendApiKey || storedGateway.email.resendApiKey,
+    sendgridApiKey:
+      params.emailConnector?.sendgridApiKey || storedGateway.email.sendgridApiKey,
+    smtpHost: params.emailConnector?.smtpHost,
+    smtpPort: params.emailConnector?.smtpPort,
+    smtpUser: params.emailConnector?.smtpUser,
+    smtpPass: params.emailConnector?.smtpPass,
+    fromEmail: params.emailConnector?.fromEmail,
+    fromName: params.emailConnector?.fromName,
+  };
 
-    if (params.action === 'reset_password') {
-      if (params.newPassword && localExisting) {
-        localExisting.password = params.newPassword;
-        registry[cleanEmail] = localExisting;
-        saveLocalAccountsRegistry(registry);
-      }
-      return {
-        account: {
-          uid: localExisting?.uid || buildDeterministicClientUid(cleanEmail),
-          email: cleanEmail,
-          displayName: localExisting?.displayName || cleanEmail.split('@')[0],
-          workspaceName: localExisting?.workspaceName || 'My Workspace',
-          provider: 'password',
-          emailVerified: Boolean(localExisting?.emailVerified),
-          isFirebaseUser: false,
-        },
-        snapshot: null,
-        message: data.message,
-      };
-    }
+  const res = await fetch('/api/accounts/auth', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      action: params.action,
+      email: cleanEmail,
+      password: params.password,
+      newPassword: params.newPassword,
+      fullName: params.fullName,
+      workspaceName: params.workspaceName,
+      uid: params.uid || localExisting?.uid,
+      code: params.code,
+      firebaseVerified: params.firebaseVerified,
+      localVerifiedAccount: Boolean(localExisting?.emailVerified),
+      gmailAccessToken: params.gmailAccessToken,
+      emailConnector: effectiveEmailConnector,
+    }),
+  });
 
-    const srvAcc = data.account || {};
-    const resolvedUid =
-      srvAcc.uid || params.uid || localExisting?.uid || buildDeterministicClientUid(cleanEmail);
-    const resolvedDisplayName =
-      srvAcc.displayName ||
-      params.fullName ||
-      localExisting?.displayName ||
-      cleanEmail.split('@')[0];
-    const resolvedWorkspaceName =
-      srvAcc.workspaceName ||
-      params.workspaceName ||
-      localExisting?.workspaceName ||
-      `${resolvedDisplayName}'s Workspace`;
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || data?.ok === false) {
+    throw new Error(
+      data?.error || 'Authentication failed. Please check your credentials.'
+    );
+  }
 
-    // If the server requires 6-digit email verification (on signup, resend_code, or unverified signin)
-    if (data.requiresVerification) {
-      const pendingSession: ActiveAccountSession = {
-        uid: resolvedUid,
-        email: cleanEmail,
-        displayName: resolvedDisplayName,
-        workspaceName: resolvedWorkspaceName,
-        provider: 'password',
-        emailVerified: false,
-        isFirebaseUser: Boolean(params.isFirebaseUser),
-      };
-
-      const vEmail = data.verificationEmail as VerificationEmailDispatchInfo | undefined;
-
-      registry[cleanEmail] = {
-        uid: pendingSession.uid,
-        email: pendingSession.email,
-        displayName: pendingSession.displayName,
-        workspaceName: pendingSession.workspaceName,
-        password: params.password || localExisting?.password || '',
-        provider: 'password',
-        emailVerified: false,
-        pendingVerificationCode: vEmail?.code || localExisting?.pendingVerificationCode,
-        createdAt: localExisting?.createdAt || new Date().toISOString(),
-      };
+  if (params.action === 'reset_password') {
+    if (params.newPassword && localExisting) {
+      localExisting.password = params.newPassword;
+      registry[cleanEmail] = localExisting;
       saveLocalAccountsRegistry(registry);
-
-      // Prepare starter workspace snapshot in local storage so it is ready immediately upon verification
-      const existingSnap = loadLocalWorkspaceSnapshot(pendingSession.uid, pendingSession.email);
-      if (!existingSnap) {
-        const starterSnap = buildStarterWorkspaceSnapshot(
-          pendingSession.uid,
-          pendingSession.email,
-          pendingSession.displayName,
-          pendingSession.workspaceName
-        );
-        saveLocalWorkspaceSnapshot(pendingSession.uid, pendingSession.email, starterSnap);
-      }
-
-      return {
-        account: pendingSession,
-        snapshot: null,
-        requiresVerification: true,
-        verificationEmail: vEmail,
-        message: data.message,
-      };
     }
-
-    // Verified account session! Save permanently across local registry, active session, and workspace snapshot
-    const session: ActiveAccountSession = {
-      uid: resolvedUid,
-      email: srvAcc.email || cleanEmail,
-      displayName: resolvedDisplayName,
-      workspaceName: resolvedWorkspaceName,
-      provider:
-        srvAcc.provider || (params.action === 'google' ? 'google.com' : 'password'),
-      emailVerified: true,
-      isFirebaseUser: Boolean(params.isFirebaseUser),
-    };
-
-    registry[cleanEmail] = {
-      uid: session.uid,
-      email: session.email,
-      displayName: session.displayName,
-      workspaceName: session.workspaceName,
-      password: params.password || localExisting?.password || '',
-      provider: session.provider,
-      emailVerified: true,
-      pendingVerificationCode: undefined,
-      createdAt: localExisting?.createdAt || new Date().toISOString(),
-    };
-    saveLocalAccountsRegistry(registry);
-    saveStoredActiveAccountSession(session);
-
-    const serverSnap = (data.snapshot as WorkspaceSnapshot) || null;
-    const localSnap = loadLocalWorkspaceSnapshot(session.uid, session.email);
-    const resolvedSnap =
-      serverSnap ||
-      localSnap ||
-      buildStarterWorkspaceSnapshot(
-        session.uid,
-        session.email,
-        session.displayName,
-        session.workspaceName
-      );
-
-    saveLocalWorkspaceSnapshot(session.uid, session.email, resolvedSnap);
-    void pushServerWorkspaceSnapshot(session.uid, session.email, resolvedSnap);
-
     return {
-      account: session,
-      snapshot: resolvedSnap,
-      requiresVerification: false,
+      account: {
+        uid: localExisting?.uid || buildDeterministicClientUid(cleanEmail),
+        email: cleanEmail,
+        displayName: localExisting?.displayName || cleanEmail.split('@')[0],
+        workspaceName: localExisting?.workspaceName || 'My Workspace',
+        provider: 'password',
+        emailVerified: Boolean(localExisting?.emailVerified),
+        isFirebaseUser: false,
+      },
+      snapshot: null,
       message: data.message,
     };
-  } catch (err) {
-    // Always rethrow explicit validation or verification errors from the server
-    if (
-      err instanceof Error &&
-      (err.message.includes('Invalid email or password') ||
-        err.message.includes('Invalid verification code') ||
-        err.message.includes('expired') ||
-        err.message.includes('6-digit') ||
-        err.message.includes('No account found') ||
-        err.message.includes('Password must be') ||
-        err.message.includes('valid email'))
-    ) {
-      throw err;
-    }
+  }
 
-    // Offline fallback if server unreachable
-    const fallbackUid =
-      params.uid || localExisting?.uid || buildDeterministicClientUid(cleanEmail);
-    const fallbackName =
-      params.fullName ||
-      localExisting?.displayName ||
-      cleanEmail
-        .split('@')[0]
-        .replace(/[._-]+/g, ' ')
-        .replace(/\b\w/g, (c) => c.toUpperCase()) ||
-      'Workspace Owner';
-    const fallbackWs =
-      params.workspaceName ||
-      localExisting?.workspaceName ||
-      `${fallbackName}'s Workspace`;
+  const srvAcc = data.account || {};
+  const resolvedUid =
+    srvAcc.uid || params.uid || localExisting?.uid || buildDeterministicClientUid(cleanEmail);
+  const resolvedDisplayName =
+    srvAcc.displayName ||
+    params.fullName ||
+    localExisting?.displayName ||
+    cleanEmail.split('@')[0];
+  const resolvedWorkspaceName =
+    srvAcc.workspaceName ||
+    params.workspaceName ||
+    localExisting?.workspaceName ||
+    `${resolvedDisplayName}'s Workspace`;
 
-    if (params.action === 'signup' || params.action === 'resend_code') {
-      const generatedCode = String(Math.floor(100000 + Math.random() * 900000));
-      const pendingSession: ActiveAccountSession = {
-        uid: fallbackUid,
-        email: cleanEmail,
-        displayName: fallbackName,
-        workspaceName: fallbackWs,
-        provider: 'password',
-        emailVerified: false,
-        isFirebaseUser: Boolean(params.isFirebaseUser),
-      };
-      registry[cleanEmail] = {
-        uid: fallbackUid,
-        email: cleanEmail,
-        displayName: fallbackName,
-        workspaceName: fallbackWs,
-        password: params.password || localExisting?.password || '',
-        provider: 'password',
-        emailVerified: false,
-        pendingVerificationCode: generatedCode,
-        createdAt: localExisting?.createdAt || new Date().toISOString(),
-      };
-      saveLocalAccountsRegistry(registry);
-
-      const vEmail: VerificationEmailDispatchInfo = {
-        to: cleanEmail,
-        subject: `Your FlowPilot Verification Code: ${generatedCode}`,
-        body: `Hi ${fallbackName},\n\nYour 6-digit verification code for ${fallbackWs} is: ${generatedCode}`,
-        code: generatedCode,
-        providerUsed: 'FlowPilot Verified Email Relay',
-        status: 'dispatched_relay',
-        sentAt: new Date().toISOString(),
-      };
-
-      return {
-        account: pendingSession,
-        snapshot: null,
-        requiresVerification: true,
-        verificationEmail: vEmail,
-        message: `A 6-digit verification code has been sent to ${cleanEmail}.`,
-      };
-    }
-
-    if (params.action === 'verify_code') {
-      const cleanCode = (params.code || '').replace(/\D/g, '');
-      if (
-        !localExisting?.pendingVerificationCode ||
-        cleanCode !== localExisting.pendingVerificationCode
-      ) {
-        throw new Error(
-          'Invalid verification code. Please check the 6-digit code sent to your email and try again.'
-        );
-      }
-    }
-
-    if (params.action === 'signin') {
-      if (!localExisting) {
-        throw new Error(
-          'No account found for this email address. Please switch to "Create Free Account" to register and verify your email.'
-        );
-      }
-      if (
-        localExisting.password &&
-        params.password &&
-        localExisting.password !== params.password &&
-        !params.firebaseVerified
-      ) {
-        throw new Error(
-          'Invalid email or password. Please verify your credentials or reset your password.'
-        );
-      }
-      if (!localExisting.emailVerified) {
-        const generatedCode =
-          localExisting.pendingVerificationCode ||
-          String(Math.floor(100000 + Math.random() * 900000));
-        localExisting.pendingVerificationCode = generatedCode;
-        registry[cleanEmail] = localExisting;
-        saveLocalAccountsRegistry(registry);
-        return {
-          account: {
-            uid: localExisting.uid,
-            email: cleanEmail,
-            displayName: localExisting.displayName,
-            workspaceName: localExisting.workspaceName,
-            provider: 'password',
-            emailVerified: false,
-            isFirebaseUser: false,
-          },
-          snapshot: null,
-          requiresVerification: true,
-          verificationEmail: {
-            to: cleanEmail,
-            subject: `Your FlowPilot Verification Code: ${generatedCode}`,
-            body: `Hi ${localExisting.displayName},\n\nYour 6-digit verification code is: ${generatedCode}`,
-            code: generatedCode,
-            providerUsed: 'FlowPilot Verified Email Relay',
-            status: 'dispatched_relay',
-            sentAt: new Date().toISOString(),
-          },
-          message: `Your account (${cleanEmail}) requires email verification. Enter the 6-digit code sent to your email.`,
-        };
-      }
-    }
-
-    const fallbackSession: ActiveAccountSession = {
-      uid: fallbackUid,
+  // If the server requires 6-digit email verification (on signup, resend_code, or unverified signin)
+  if (data.requiresVerification) {
+    const pendingSession: ActiveAccountSession = {
+      uid: resolvedUid,
       email: cleanEmail,
-      displayName: fallbackName,
-      workspaceName: fallbackWs,
-      provider: params.action === 'google' ? 'google.com' : 'password',
-      emailVerified: true,
+      displayName: resolvedDisplayName,
+      workspaceName: resolvedWorkspaceName,
+      provider: 'password',
+      emailVerified: false,
       isFirebaseUser: Boolean(params.isFirebaseUser),
     };
 
+    const vEmail = data.verificationEmail as VerificationEmailDispatchInfo | undefined;
+
     registry[cleanEmail] = {
-      uid: fallbackSession.uid,
-      email: fallbackSession.email,
-      displayName: fallbackSession.displayName,
-      workspaceName: fallbackSession.workspaceName,
+      uid: pendingSession.uid,
+      email: pendingSession.email,
+      displayName: pendingSession.displayName,
+      workspaceName: pendingSession.workspaceName,
       password: params.password || localExisting?.password || '',
-      provider: fallbackSession.provider,
-      emailVerified: true,
-      pendingVerificationCode: undefined,
+      provider: 'password',
+      emailVerified: false,
       createdAt: localExisting?.createdAt || new Date().toISOString(),
     };
     saveLocalAccountsRegistry(registry);
-    saveStoredActiveAccountSession(fallbackSession);
 
-    const existingSnap =
-      loadLocalWorkspaceSnapshot(fallbackSession.uid, fallbackSession.email) ||
-      buildStarterWorkspaceSnapshot(
-        fallbackSession.uid,
-        fallbackSession.email,
-        fallbackSession.displayName,
-        fallbackSession.workspaceName
+    // Prepare starter workspace snapshot in local storage so it is ready immediately upon verification
+    const existingSnap = loadLocalWorkspaceSnapshot(pendingSession.uid, pendingSession.email);
+    if (!existingSnap) {
+      const starterSnap = buildStarterWorkspaceSnapshot(
+        pendingSession.uid,
+        pendingSession.email,
+        pendingSession.displayName,
+        pendingSession.workspaceName
       );
-    saveLocalWorkspaceSnapshot(
-      fallbackSession.uid,
-      fallbackSession.email,
-      existingSnap
-    );
+      saveLocalWorkspaceSnapshot(pendingSession.uid, pendingSession.email, starterSnap);
+    }
 
     return {
-      account: fallbackSession,
-      snapshot: existingSnap,
-      requiresVerification: false,
+      account: pendingSession,
+      snapshot: null,
+      requiresVerification: true,
+      verificationEmail: vEmail,
+      message: data.message,
     };
   }
+
+  // Verified account session! Save permanently across local registry, active session, and workspace snapshot
+  const session: ActiveAccountSession = {
+    uid: resolvedUid,
+    email: srvAcc.email || cleanEmail,
+    displayName: resolvedDisplayName,
+    workspaceName: resolvedWorkspaceName,
+    provider:
+      srvAcc.provider || (params.action === 'google' ? 'google.com' : 'password'),
+    emailVerified: true,
+    isFirebaseUser: Boolean(params.isFirebaseUser),
+  };
+
+  registry[cleanEmail] = {
+    uid: session.uid,
+    email: session.email,
+    displayName: session.displayName,
+    workspaceName: session.workspaceName,
+    password: params.password || localExisting?.password || '',
+    provider: session.provider,
+    emailVerified: true,
+    createdAt: localExisting?.createdAt || new Date().toISOString(),
+  };
+  saveLocalAccountsRegistry(registry);
+  saveStoredActiveAccountSession(session);
+
+  const serverSnap = (data.snapshot as WorkspaceSnapshot) || null;
+  const localSnap = loadLocalWorkspaceSnapshot(session.uid, session.email);
+  const resolvedSnap =
+    serverSnap ||
+    localSnap ||
+    buildStarterWorkspaceSnapshot(
+      session.uid,
+      session.email,
+      session.displayName,
+      session.workspaceName
+    );
+
+  saveLocalWorkspaceSnapshot(session.uid, session.email, resolvedSnap);
+  void pushServerWorkspaceSnapshot(session.uid, session.email, resolvedSnap);
+
+  return {
+    account: session,
+    snapshot: resolvedSnap,
+    requiresVerification: false,
+    message: data.message,
+  };
 }
 
 /**

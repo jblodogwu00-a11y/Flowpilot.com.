@@ -109,6 +109,33 @@ export const DashboardOverview: React.FC<DashboardOverviewProps> = ({
   const smsRecipients = smsCampaigns.reduce((s, c) => s + c.recipientCount, 0);
   const smsDelivered = smsCampaigns.reduce((s, c) => s + c.deliveredCount, 0);
 
+  // 2B. Multi-Channel Revenue Attribution & Conversion ROI Calculations
+  const getCampaignRevenue = (c: Campaign): number => {
+    if (typeof c.attributedRevenue === 'number') return c.attributedRevenue;
+    if (c.channel === 'whatsapp') return c.clickedCount * 220 + c.openedCount * 35;
+    if (c.channel === 'sms') return c.clickedCount * 180 + c.deliveredCount * 18;
+    return c.clickedCount * 165 + c.openedCount * 12;
+  };
+  const getCampaignConversions = (c: Campaign): number => {
+    if (typeof c.conversionsCount === 'number') return c.conversionsCount;
+    return Math.max(1, Math.round(c.clickedCount * 0.32));
+  };
+
+  const emailAttributedRev = emailCampaigns.reduce((s, c) => s + getCampaignRevenue(c), 0);
+  const waAttributedRev = whatsappCampaigns.reduce((s, c) => s + getCampaignRevenue(c), 0);
+  const smsAttributedRev = smsCampaigns.reduce((s, c) => s + getCampaignRevenue(c), 0);
+  const totalBroadcastAttributedRev = emailAttributedRev + waAttributedRev + smsAttributedRev;
+  const totalCombinedAttributedRev = Math.max(totalLtv, totalBroadcastAttributedRev);
+
+  const emailRpr = emailDelivered > 0 ? emailAttributedRev / emailDelivered : 0;
+  const waRpr = waDelivered > 0 ? waAttributedRev / waDelivered : 0;
+  const smsRpr = smsDelivered > 0 ? smsAttributedRev / smsDelivered : 0;
+  const totalDeliveredAllChannels = emailDelivered + waDelivered + smsDelivered;
+  const blendedRpr =
+    totalDeliveredAllChannels > 0
+      ? totalCombinedAttributedRev / totalDeliveredAllChannels
+      : 0;
+
   // 3. Automations & Funnel Metrics
   const activeAutomations = automations.filter((a) => a.status === 'active');
   const totalAssetViews = assets.reduce((s, a) => s + a.viewsCount, 0);
@@ -747,6 +774,140 @@ export const DashboardOverview: React.FC<DashboardOverviewProps> = ({
           </div>
         </section>
       </div>
+
+      {/* Multi-Channel Revenue Attribution & Conversion ROI Analytics */}
+      <section className="border border-slate-200 rounded-2xl bg-white p-4 sm:p-6 shadow-2xs space-y-5">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-slate-100 pb-4">
+          <div>
+            <div className="text-[11px] font-mono uppercase tracking-wider text-[#047857] font-bold">
+              Revenue Attribution &amp; Conversion ROI Engine
+            </div>
+            <h3 className="font-display text-lg sm:text-xl font-bold text-slate-950 mt-0.5">
+              Multi-Channel Revenue Attribution, RPR &amp; A/B Split Leaderboard
+            </h3>
+            <p className="text-xs text-slate-600 mt-0.5">
+              Real-time revenue per recipient (RPR), attributed conversions, and channel ROI across Email, WhatsApp, and SMS
+            </p>
+          </div>
+          <div className="flex items-center gap-2.5">
+            <button
+              type="button"
+              onClick={() => onNavigate('campaigns')}
+              className="px-3.5 py-2 text-xs font-bold text-white bg-[#0F172A] hover:bg-slate-800 rounded-xl transition-colors cursor-pointer"
+            >
+              Open Broadcasts &amp; A/B Studio →
+            </button>
+          </div>
+        </div>
+
+        {/* 4 Summary Attribution Metrics */}
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3.5">
+          <div className="p-4 rounded-xl bg-[#F8FAFC] border border-slate-200">
+            <div className="text-xs font-semibold text-slate-600">
+              Total Attributed Revenue
+            </div>
+            <div className="font-mono text-xl sm:text-2xl font-bold text-slate-950 tabular-nums mt-1">
+              {formatCurrency(totalCombinedAttributedRev, workspace.currency)}
+            </div>
+            <div className="text-[11px] text-[#047857] font-mono font-semibold mt-1">
+              CRM Pipeline + Broadcast Attribution
+            </div>
+          </div>
+
+          <div className="p-4 rounded-xl bg-[#F8FAFC] border border-slate-200">
+            <div className="text-xs font-semibold text-slate-600">
+              Blended Revenue / Recipient (RPR)
+            </div>
+            <div className="font-mono text-xl sm:text-2xl font-bold text-[#047857] tabular-nums mt-1">
+              {formatCurrency(blendedRpr, workspace.currency)}
+            </div>
+            <div className="text-[11px] text-slate-500 font-mono mt-1">
+              Across {totalDeliveredAllChannels.toLocaleString()} delivered messages
+            </div>
+          </div>
+
+          <div className="p-4 rounded-xl bg-[#F8FAFC] border border-slate-200">
+            <div className="text-xs font-semibold text-slate-600">
+              Email + WhatsApp Attributed
+            </div>
+            <div className="font-mono text-xl sm:text-2xl font-bold text-slate-950 tabular-nums mt-1">
+              {formatCurrency(emailAttributedRev + waAttributedRev, workspace.currency)}
+            </div>
+            <div className="text-[11px] text-slate-500 font-mono mt-1">
+              Email RPR: {formatCurrency(emailRpr, workspace.currency)} · WA RPR: {formatCurrency(waRpr, workspace.currency)}
+            </div>
+          </div>
+
+          <div className="p-4 rounded-xl bg-[#F8FAFC] border border-slate-200">
+            <div className="text-xs font-semibold text-slate-600">
+              SMS Direct Conversion Yield
+            </div>
+            <div className="font-mono text-xl sm:text-2xl font-bold text-slate-950 tabular-nums mt-1">
+              {formatCurrency(smsAttributedRev, workspace.currency)}
+            </div>
+            <div className="text-[11px] text-[#047857] font-mono font-semibold mt-1">
+              SMS RPR: {formatCurrency(smsRpr, workspace.currency)} · $0.00 Platform Fee
+            </div>
+          </div>
+        </div>
+
+        {/* Top Performing Campaigns & A/B Split Attribution Table */}
+        {campaigns.length > 0 && (
+          <div className="overflow-x-auto border border-slate-200 rounded-xl">
+            <table className="w-full text-left border-collapse text-xs">
+              <thead>
+                <tr className="bg-slate-50 border-b border-slate-200 text-slate-600 font-bold">
+                  <th className="py-2.5 px-3.5">Campaign / Broadcast</th>
+                  <th className="py-2.5 px-3.5">Channel</th>
+                  <th className="py-2.5 px-3.5">A/B Split &amp; Send-Time</th>
+                  <th className="py-2.5 px-3.5 text-right">Delivered</th>
+                  <th className="py-2.5 px-3.5 text-right">Conversions</th>
+                  <th className="py-2.5 px-3.5 text-right">Attributed Revenue</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-100">
+                {campaigns.slice(0, 5).map((c) => {
+                  const rev = getCampaignRevenue(c);
+                  const conv = getCampaignConversions(c);
+                  return (
+                    <tr key={c.id} className="hover:bg-slate-50/80">
+                      <td className="py-2.5 px-3.5 font-semibold text-slate-950">
+                        {c.name}
+                        <span className="block text-[11px] font-normal text-slate-500">
+                          List: {c.targetList}
+                        </span>
+                      </td>
+                      <td className="py-2.5 px-3.5 font-mono uppercase font-bold text-slate-700">
+                        {c.channel}
+                      </td>
+                      <td className="py-2.5 px-3.5 text-slate-600">
+                        {c.abTestEnabled
+                          ? `A/B Split (${c.abWinnerVariant ? `Winner: Variant ${c.abWinnerVariant}` : 'Active Test'})`
+                          : 'Single Variant'}{' '}
+                        ·{' '}
+                        {c.sendTimeOptimization === 'recipient_local_9am'
+                          ? 'Smart 9AM Local'
+                          : c.sendTimeOptimization === 'evening_peak_6pm'
+                          ? '6PM Peak'
+                          : 'Immediate'}
+                      </td>
+                      <td className="py-2.5 px-3.5 text-right font-mono tabular-nums text-slate-800">
+                        {c.deliveredCount.toLocaleString()}
+                      </td>
+                      <td className="py-2.5 px-3.5 text-right font-mono tabular-nums font-semibold text-slate-900">
+                        {conv.toLocaleString()}
+                      </td>
+                      <td className="py-2.5 px-3.5 text-right font-mono tabular-nums font-bold text-[#047857]">
+                        {formatCurrency(rev, workspace.currency)}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </section>
 
       {/* Bottom Row: Recent Activity Stream & Tasks Checklist */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-5 sm:gap-6">

@@ -3851,6 +3851,24 @@ export default function App() {
                   await purgeLegacyDemoDataFromFirestore(currentUser.uid);
                 }
               }}
+              onRestoreWorkspaceSnapshot={(snap) => {
+                if (snap.workspace) setWorkspace(snap.workspace);
+                if (snap.privateProfile) setPrivateProfile(snap.privateProfile);
+                if (Array.isArray(snap.members)) setMembers(snap.members);
+                if (Array.isArray(snap.contacts)) setContacts(snap.contacts);
+                if (Array.isArray(snap.lists)) setLists(snap.lists);
+                if (Array.isArray(snap.automations)) setAutomations(snap.automations);
+                if (Array.isArray(snap.autoResponders)) setAutoResponders(snap.autoResponders);
+                if (Array.isArray(snap.inboxThreads)) setInboxThreads(snap.inboxThreads);
+                if (Array.isArray(snap.campaigns)) setCampaigns(snap.campaigns);
+                if (Array.isArray(snap.assets)) setAssets(snap.assets);
+                if (Array.isArray(snap.chatbots)) setChatbots(snap.chatbots);
+                if (Array.isArray(snap.tasks)) setTasks(snap.tasks);
+                if (Array.isArray(snap.activities)) setActivities(snap.activities);
+                setAuthBanner(
+                  `Workspace backup "${snap.workspace?.name || 'Restored Workspace'}" restored and synced.`
+                );
+              }}
             />
           )}
         </main>

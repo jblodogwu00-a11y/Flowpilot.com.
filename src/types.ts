@@ -357,6 +357,16 @@ export interface Campaign {
   segmentFilter?: string;
   scheduledAt?: string;
   blocksJson?: string;
+  abTestEnabled?: boolean;
+  variantBSubject?: string;
+  variantBBody?: string;
+  abWinningMetric?: 'open_rate' | 'click_rate';
+  abSamplePercent?: number;
+  abWinnerVariant?: 'A' | 'B' | 'pending';
+  sendTimeOptimization?: 'immediate' | 'recipient_local_9am' | 'evening_peak_6pm';
+  attributedRevenue?: number;
+  conversionsCount?: number;
+  campaignCost?: number;
   createdAt?: Timestamp | string;
   updatedAt?: Timestamp | string;
 }

@@ -14,6 +14,8 @@ import {
 } from 'firebase/auth';
 import {
   getFirestore,
+  initializeFirestore,
+  setLogLevel,
   doc,
   getDocFromServer,
 } from 'firebase/firestore';
@@ -21,6 +23,7 @@ import firebaseConfig from '../firebase-applet-config.json';
 import {
   ActiveAccountSession,
   VerificationEmailDispatchInfo,
+  VerificationEmailConnectorOverride,
   WorkspaceSnapshot,
   getStoredActiveAccountSession,
   saveStoredActiveAccountSession,
@@ -29,10 +32,24 @@ import {
 } from './services/accountPersistenceService';
 
 const app = initializeApp(firebaseConfig);
-export const db = getFirestore(
-  app,
-  firebaseConfig.firestoreDatabaseId || 'ai-studio-53b8d6de-81d3-4f2a-9ea0-7359072dfac0'
-);
+const targetDatabaseId =
+  firebaseConfig.firestoreDatabaseId || 'ai-studio-53b8d6de-81d3-4f2a-9ea0-7359072dfac0';
+
+setLogLevel('silent');
+
+export const db = (() => {
+  try {
+    return initializeFirestore(
+      app,
+      {
+        experimentalAutoDetectLongPolling: true,
+      },
+      targetDatabaseId
+    );
+  } catch {
+    return getFirestore(app, targetDatabaseId);
+  }
+})();
 export const auth = getAuth(app);
 
 // Gmail send scope is requested ONLY when explicitly connecting Gmail in Workspace Settings
@@ -327,12 +344,11 @@ export function handleFirestoreError(
 }
 
 async function testConnection() {
+  if (!auth.currentUser) return;
   try {
     await getDocFromServer(doc(db, 'test', 'connection'));
-  } catch (error) {
-    if (error instanceof Error && error.message.includes('the client is offline')) {
-      console.warn('Firestore connection check notice: verifying database connectivity.');
-    }
+  } catch {
+    // Non-fatal connectivity check
   }
 }
 
@@ -443,7 +459,8 @@ export interface EmailAuthOutcome {
 
 export async function signInWithEmail(
   email: string,
-  password: string
+  password: string,
+  emailConnector?: VerificationEmailConnectorOverride
 ): Promise<EmailAuthOutcome> {
   const cleanEmail = email.trim().toLowerCase();
   let fbUser: User | null = null;
@@ -465,6 +482,8 @@ export async function signInWithEmail(
       fullName: fbUser?.displayName || undefined,
       firebaseVerified: Boolean(fbUser && fbUser.emailVerified),
       isFirebaseUser: Boolean(fbUser),
+      gmailAccessToken: cachedAccessToken || undefined,
+      emailConnector,
     });
 
     if (synced.requiresVerification) {
@@ -496,7 +515,8 @@ export async function signUpWithEmail(
   fullName: string,
   email: string,
   password: string,
-  workspaceName?: string
+  workspaceName?: string,
+  emailConnector?: VerificationEmailConnectorOverride
 ): Promise<EmailAuthOutcome> {
   const cleanEmail = email.trim().toLowerCase();
   const cleanName = fullName.trim();
@@ -541,6 +561,8 @@ export async function signUpWithEmail(
       uid: fbUser?.uid,
       firebaseVerified: false,
       isFirebaseUser: Boolean(fbUser),
+      gmailAccessToken: cachedAccessToken || undefined,
+      emailConnector,
     });
 
     return {
@@ -551,7 +573,7 @@ export async function signUpWithEmail(
       verificationEmail: synced.verificationEmail,
       message:
         synced.message ||
-        `A 6-digit verification code has been sent to ${cleanEmail}. Please enter the code to verify and save your account.`,
+        `A 6-digit verification code has been sent to ${cleanEmail}. Please check your email inbox and enter the code below to verify your account.`,
     };
   } finally {
     isPendingVerificationFlow = false;
@@ -606,6 +628,7 @@ export async function resendAccountVerificationCode(params: {
   email: string;
   fullName?: string;
   workspaceName?: string;
+  emailConnector?: VerificationEmailConnectorOverride;
 }): Promise<{
   verificationEmail?: VerificationEmailDispatchInfo;
   message: string;
@@ -617,6 +640,8 @@ export async function resendAccountVerificationCode(params: {
     fullName: params.fullName,
     workspaceName: params.workspaceName,
     uid: auth.currentUser?.uid,
+    gmailAccessToken: cachedAccessToken || undefined,
+    emailConnector: params.emailConnector,
   });
 
   return {

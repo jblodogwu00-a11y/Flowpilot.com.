@@ -13,6 +13,7 @@ import {
   KeyRound,
   ShieldCheck,
   RefreshCw,
+  SlidersHorizontal,
 } from 'lucide-react';
 import {
   signInWithGoogle,
@@ -21,8 +22,16 @@ import {
   verifyAccountEmailCode,
   resendAccountVerificationCode,
   triggerPasswordReset,
+  connectGmailAccountWithPopup,
 } from '../firebase';
-import { VerificationEmailDispatchInfo } from '../services/accountPersistenceService';
+import {
+  VerificationEmailDispatchInfo,
+  VerificationEmailConnectorOverride,
+} from '../services/accountPersistenceService';
+import {
+  getStoredChannelGatewayConfig,
+  saveStoredChannelGatewayConfig,
+} from '../services/messageDeliveryService';
 import { FlowPilotLogo } from './FlowPilotLogo';
 
 export type AuthModalMode = 'signin' | 'signup' | 'forgot' | 'verify_code';
@@ -54,11 +63,28 @@ export const AuthModal: React.FC<AuthModalProps> = ({
   const [resetNewPassword, setResetNewPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
 
-  // Mandatory 6-Digit Email Verification Code state
+  // Confidential Email-Only 6-Digit Verification Code state (Code is NEVER displayed on platform)
   const [verificationCodeInput, setVerificationCodeInput] = useState('');
   const [dispatchedEmailInfo, setDispatchedEmailInfo] =
     useState<VerificationEmailDispatchInfo | null>(null);
-  const [showDispatchedEmailBody, setShowDispatchedEmailBody] = useState(true);
+
+  // Optional Multi-Provider Email Gateway configuration for direct inbox delivery
+  const [showGatewayConfig, setShowGatewayConfig] = useState(false);
+  const storedGateway = getStoredChannelGatewayConfig();
+  const [gatewayProviderMode, setGatewayProviderMode] = useState<
+    'gmail_oauth' | 'resend_api' | 'sendgrid_api' | 'smtp' | 'builtin_relay'
+  >(storedGateway.email.providerMode || 'resend_api');
+  const [resendApiKeyInput, setResendApiKeyInput] = useState(
+    storedGateway.email.resendApiKey || ''
+  );
+  const [sendgridApiKeyInput, setSendgridApiKeyInput] = useState(
+    storedGateway.email.sendgridApiKey || ''
+  );
+  const [smtpHostInput, setSmtpHostInput] = useState('smtp.gmail.com');
+  const [smtpPortInput, setSmtpPortInput] = useState('587');
+  const [smtpUserInput, setSmtpUserInput] = useState('');
+  const [smtpPassInput, setSmtpPassInput] = useState('');
+  const [senderFromEmailInput, setSenderFromEmailInput] = useState('');
 
   // If browser/iframe blocks OAuth popup, allow 1-step Google account confirmation
   const [showGoogleQuickInput, setShowGoogleQuickInput] = useState(false);
@@ -80,6 +106,36 @@ export const AuthModal: React.FC<AuthModalProps> = ({
   }, [isOpen, initialMode]);
 
   if (!isOpen) return null;
+
+  const buildEmailConnectorOverride = (): VerificationEmailConnectorOverride => {
+    // Persist Resend/SendGrid keys if entered so the workspace keeps them
+    if (resendApiKeyInput.trim() || sendgridApiKeyInput.trim()) {
+      const current = getStoredChannelGatewayConfig();
+      saveStoredChannelGatewayConfig({
+        ...current,
+        email: {
+          ...current.email,
+          providerMode:
+            gatewayProviderMode === 'smtp' ? 'builtin_relay' : gatewayProviderMode,
+          resendApiKey: resendApiKeyInput.trim() || current.email.resendApiKey,
+          sendgridApiKey:
+            sendgridApiKeyInput.trim() || current.email.sendgridApiKey,
+        },
+      });
+    }
+
+    return {
+      providerMode: gatewayProviderMode,
+      resendApiKey: resendApiKeyInput.trim() || undefined,
+      sendgridApiKey: sendgridApiKeyInput.trim() || undefined,
+      smtpHost: smtpHostInput.trim() || undefined,
+      smtpPort: smtpPortInput.trim() || undefined,
+      smtpUser: smtpUserInput.trim() || undefined,
+      smtpPass: smtpPassInput.trim() || undefined,
+      fromEmail: senderFromEmailInput.trim() || smtpUserInput.trim() || undefined,
+      fromName: 'FlowPilot Account Security',
+    };
+  };
 
   const formatFirebaseAuthError = (err: unknown): string => {
     const raw = err instanceof Error ? err.message : String(err);
@@ -117,14 +173,18 @@ export const AuthModal: React.FC<AuthModalProps> = ({
 
     setIsLoading(true);
     try {
-      const outcome = await signInWithEmail(email.trim(), password);
+      const outcome = await signInWithEmail(
+        email.trim(),
+        password,
+        buildEmailConnectorOverride()
+      );
       if (outcome.requiresVerification) {
         setDispatchedEmailInfo(outcome.verificationEmail || null);
         setVerificationCodeInput('');
         setMode('verify_code');
         setSuccessMsg(
           outcome.message ||
-            `A 6-digit verification code has been sent to ${email.trim()}. Enter the code below to verify your account.`
+            `A 6-digit verification code has been sent exclusively to ${email.trim()}. Please check your email inbox and enter the code below.`
         );
         return;
       }
@@ -173,7 +233,8 @@ export const AuthModal: React.FC<AuthModalProps> = ({
         fullName.trim(),
         email.trim(),
         password,
-        resolvedWsName
+        resolvedWsName,
+        buildEmailConnectorOverride()
       );
 
       setDispatchedEmailInfo(outcome.verificationEmail || null);
@@ -181,7 +242,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
       setMode('verify_code');
       setSuccessMsg(
         outcome.message ||
-          `Verification code sent to ${email.trim()}! Enter the 6-digit code below to verify and save your account.`
+          `A 6-digit verification code has been sent exclusively to ${email.trim()}. Check your email inbox and enter the code below to verify and activate your account.`
       );
     } catch (err) {
       setErrorMsg(formatFirebaseAuthError(err));
@@ -242,12 +303,44 @@ export const AuthModal: React.FC<AuthModalProps> = ({
         email: email.trim(),
         fullName: fullName.trim() || undefined,
         workspaceName: resolvedWsName,
+        emailConnector: buildEmailConnectorOverride(),
       });
       if (res.verificationEmail) {
         setDispatchedEmailInfo(res.verificationEmail);
       }
       setVerificationCodeInput('');
       setSuccessMsg(res.message);
+    } catch (err) {
+      setErrorMsg(formatFirebaseAuthError(err));
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const handleConnectGmailAndResend = async () => {
+    setErrorMsg(null);
+    setSuccessMsg(null);
+    setIsLoading(true);
+    try {
+      await connectGmailAccountWithPopup();
+      setGatewayProviderMode('gmail_oauth');
+      const resolvedWsName =
+        workspaceName.trim() ||
+        (fullName.trim() ? `${fullName.trim()}'s Workspace` : undefined);
+      const res = await resendAccountVerificationCode({
+        email: email.trim(),
+        fullName: fullName.trim() || undefined,
+        workspaceName: resolvedWsName,
+        emailConnector: {
+          providerMode: 'gmail_oauth',
+        },
+      });
+      if (res.verificationEmail) {
+        setDispatchedEmailInfo(res.verificationEmail);
+      }
+      setSuccessMsg(
+        `Verification code dispatched via your connected Gmail account to ${email.trim()}! Please check your email inbox.`
+      );
     } catch (err) {
       setErrorMsg(formatFirebaseAuthError(err));
     } finally {
@@ -381,7 +474,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
               ·
             </span>
             <span className="text-sm font-semibold text-emerald-400">
-              {mode === 'verify_code' ? 'Email Verification Required' : '100% Free Forever'}
+              {mode === 'verify_code' ? 'Email-Only Verification' : '100% Free Forever'}
             </span>
           </div>
           <button
@@ -440,16 +533,16 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                 : mode === 'signup'
                 ? 'Create your free account'
                 : mode === 'verify_code'
-                ? 'Verify your email with code'
+                ? 'Check your email inbox'
                 : 'Reset your password'}
             </h2>
             <p className="text-sm text-slate-600 mt-1.5">
               {mode === 'signin'
                 ? 'Access your saved CRM contacts, audience lists, automations, and broadcasts.'
                 : mode === 'signup'
-                ? 'Register your account and verify your email address with a 6-digit security code.'
+                ? 'Register your account and verify ownership of your email inbox with a 6-digit security code.'
                 : mode === 'verify_code'
-                ? `We sent a 6-digit verification code to ${email || 'your email'}. You must enter the code below to verify and save your account.`
+                ? `We dispatched a 6-digit verification code exclusively to ${email || 'your email address'}. Enter the code from your email inbox below to activate your account.`
                 : 'Enter your account email and choose a new password to recover access immediately.'}
             </p>
           </div>
@@ -471,69 +564,42 @@ export const AuthModal: React.FC<AuthModalProps> = ({
           )}
 
           {/* ================================================================= */}
-          {/* MANDATORY 6-DIGIT EMAIL VERIFICATION CODE SCREEN                  */}
+          {/* CONFIDENTIAL EMAIL-ONLY 6-DIGIT VERIFICATION CODE SCREEN          */}
+          {/* (Verification code is NEVER shown on the platform UI)             */}
           {/* ================================================================= */}
           {mode === 'verify_code' && (
             <div className="space-y-4">
-              {/* Live Dispatched Email Delivery Card */}
-              {dispatchedEmailInfo && (
-                <div className="p-4 rounded-xl bg-slate-900 text-white border border-slate-800 space-y-2.5">
-                  <div className="flex items-center justify-between gap-2">
-                    <div className="flex items-center gap-2 text-xs font-bold text-emerald-400">
-                      <ShieldCheck className="w-4 h-4 shrink-0" />
-                      <span>Verification Email Dispatched to {dispatchedEmailInfo.to}</span>
-                    </div>
-                    <button
-                      type="button"
-                      onClick={() => setShowDispatchedEmailBody((prev) => !prev)}
-                      className="text-[11px] font-semibold text-slate-300 hover:text-white underline cursor-pointer"
-                    >
-                      {showDispatchedEmailBody ? 'Hide Email' : 'View Email'}
-                    </button>
+              {/* Confidential Email Security Notice (Zero On-Platform Code Exposure) */}
+              <div className="p-4 rounded-xl bg-slate-900 text-white border border-slate-800 space-y-2">
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-2 text-xs font-bold text-emerald-400">
+                    <ShieldCheck className="w-4 h-4 shrink-0" />
+                    <span>
+                      Confidential Email-Only Delivery · {dispatchedEmailInfo?.to || email}
+                    </span>
                   </div>
-
-                  <div className="text-[11px] text-slate-300 font-mono">
-                    Gateway: {dispatchedEmailInfo.providerUsed} · Subject:{' '}
-                    {dispatchedEmailInfo.subject}
-                  </div>
-
-                  {showDispatchedEmailBody && (
-                    <div className="p-3 rounded-lg bg-slate-950 border border-slate-800 space-y-2">
-                      <div className="text-xs text-slate-300 leading-relaxed">
-                        Hi{' '}
-                        <span className="font-semibold text-white">
-                          {fullName.trim() || dispatchedEmailInfo.to.split('@')[0]}
-                        </span>
-                        , use the 6-digit verification code sent to{' '}
-                        <span className="font-mono text-emerald-300">
-                          {dispatchedEmailInfo.to}
-                        </span>{' '}
-                        to verify and permanently save your account:
-                      </div>
-                      <div className="flex items-center justify-between gap-3 pt-1">
-                        <div className="px-3.5 py-2 rounded-lg bg-emerald-950/90 border border-emerald-700/70 font-mono text-lg font-bold tracking-[0.25em] text-emerald-300">
-                          {dispatchedEmailInfo.code}
-                        </div>
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setVerificationCodeInput(dispatchedEmailInfo.code);
-                            setErrorMsg(null);
-                          }}
-                          className="px-3 py-2 text-xs font-bold text-slate-950 bg-emerald-400 hover:bg-emerald-300 rounded-lg transition-colors cursor-pointer shrink-0"
-                        >
-                          Use Code {dispatchedEmailInfo.code}
-                        </button>
-                      </div>
-                    </div>
-                  )}
+                  <span className="text-[11px] font-mono text-slate-400">
+                    15m expiry
+                  </span>
                 </div>
-              )}
+                <p className="text-xs text-slate-300 leading-relaxed">
+                  For your security, the 6-digit verification code is{' '}
+                  <strong className="text-white">
+                    sent only to your email address ({dispatchedEmailInfo?.to || email})
+                  </strong>{' '}
+                  and is never displayed on this platform. Please check your inbox (and spam or promotions folder) to retrieve your code.
+                </p>
+                {dispatchedEmailInfo && (
+                  <div className="text-[11px] text-slate-400 font-mono pt-1 border-t border-slate-800">
+                    Gateway: {dispatchedEmailInfo.providerUsed}
+                  </div>
+                )}
+              </div>
 
               <form onSubmit={handleVerifyEmailCode} className="space-y-4">
                 <div>
                   <label className="block text-sm font-bold text-slate-900 mb-1.5">
-                    Enter 6-Digit Verification Code *
+                    Enter 6-Digit Code from Your Email *
                   </label>
                   <div className="relative">
                     <KeyRound className="w-4 h-4 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2" />
@@ -546,12 +612,12 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                       onChange={(e) =>
                         setVerificationCodeInput(e.target.value.replace(/\D/g, '').slice(0, 6))
                       }
-                      placeholder="Enter 6-digit code (e.g. 482910)"
+                      placeholder="Enter 6-digit code from email"
                       className="w-full pl-10 pr-4 py-3 text-base font-mono font-bold tracking-[0.25em] bg-slate-50 border border-slate-300 rounded-xl text-slate-950 focus:outline-none focus:border-slate-950 focus:bg-white"
                     />
                   </div>
                   <p className="text-xs text-slate-500 mt-1.5">
-                    Account creation requires verifying the 6-digit code sent to{' '}
+                    Enter the 6-digit verification code delivered to{' '}
                     <span className="font-mono font-semibold text-slate-700">
                       {email}
                     </span>
@@ -566,35 +632,199 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                 >
                   <span>
                     {isLoading
-                      ? 'Verifying & Saving Account...'
+                      ? 'Verifying & Activating Account...'
                       : 'Verify Code & Save Account'}
                   </span>
                   <ArrowRight className="w-4 h-4" />
                 </button>
               </form>
 
-              <div className="pt-2 border-t border-slate-200 flex items-center justify-between gap-2 text-xs">
-                <button
-                  type="button"
-                  disabled={isLoading}
-                  onClick={handleResendVerificationCode}
-                  className="font-bold text-[#047857] hover:underline inline-flex items-center gap-1.5 cursor-pointer"
-                >
-                  <RefreshCw className="w-3.5 h-3.5" />
-                  <span>Resend Verification Code</span>
-                </button>
+              {/* Multi-Provider Email Gateway Delivery Configurator (Gmail / Resend / SendGrid / SMTP) */}
+              <div className="pt-2 border-t border-slate-200 space-y-3">
+                <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+                  <button
+                    type="button"
+                    disabled={isLoading}
+                    onClick={handleResendVerificationCode}
+                    className="font-bold text-[#047857] hover:underline inline-flex items-center gap-1.5 cursor-pointer"
+                  >
+                    <RefreshCw className="w-3.5 h-3.5" />
+                    <span>Resend Code to Email</span>
+                  </button>
 
-                <button
-                  type="button"
-                  onClick={() => {
-                    setMode('signup');
-                    setErrorMsg(null);
-                    setSuccessMsg(null);
-                  }}
-                  className="font-semibold text-slate-600 hover:text-slate-950 cursor-pointer"
-                >
-                  Change Email Address
-                </button>
+                  <button
+                    type="button"
+                    onClick={() => setShowGatewayConfig((prev) => !prev)}
+                    className="font-semibold text-blue-700 hover:underline inline-flex items-center gap-1 cursor-pointer"
+                  >
+                    <SlidersHorizontal className="w-3.5 h-3.5" />
+                    <span>
+                      {showGatewayConfig
+                        ? 'Hide Email Provider Settings'
+                        : 'Configure Email Delivery Provider'}
+                    </span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setMode('signup');
+                      setErrorMsg(null);
+                      setSuccessMsg(null);
+                    }}
+                    className="font-semibold text-slate-600 hover:text-slate-950 cursor-pointer"
+                  >
+                    Change Email
+                  </button>
+                </div>
+
+                {showGatewayConfig && (
+                  <div className="p-4 rounded-xl bg-slate-50 border border-slate-200 space-y-3 text-xs">
+                    <div className="font-bold text-slate-900">
+                      Multi-Provider Outbound Verification Email Setup
+                    </div>
+                    <p className="text-slate-600 leading-relaxed">
+                      Connect Gmail OAuth or provide your Resend, SendGrid, or SMTP credentials to dispatch the 6-digit verification email directly through your provider to{' '}
+                      <strong className="text-slate-900">{email}</strong>.
+                    </p>
+
+                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-1.5">
+                      {(
+                        [
+                          { id: 'gmail_oauth', label: 'Gmail OAuth' },
+                          { id: 'resend_api', label: 'Resend API' },
+                          { id: 'sendgrid_api', label: 'SendGrid API' },
+                          { id: 'smtp', label: 'Custom SMTP' },
+                        ] as const
+                      ).map((prov) => (
+                        <button
+                          key={prov.id}
+                          type="button"
+                          onClick={() => setGatewayProviderMode(prov.id)}
+                          className={`py-2 px-2.5 rounded-lg font-bold border transition-colors cursor-pointer ${
+                            gatewayProviderMode === prov.id
+                              ? 'bg-[#0F172A] text-white border-[#0F172A]'
+                              : 'bg-white text-slate-700 border-slate-300 hover:border-slate-500'
+                          }`}
+                        >
+                          {prov.label}
+                        </button>
+                      ))}
+                    </div>
+
+                    {gatewayProviderMode === 'gmail_oauth' && (
+                      <div className="pt-1">
+                        <button
+                          type="button"
+                          disabled={isLoading}
+                          onClick={handleConnectGmailAndResend}
+                          className="w-full py-2.5 px-4 bg-[#0F172A] hover:bg-slate-800 text-white font-bold rounded-lg transition-colors cursor-pointer"
+                        >
+                          Connect Gmail OAuth &amp; Send Verification Email Now
+                        </button>
+                      </div>
+                    )}
+
+                    {gatewayProviderMode === 'resend_api' && (
+                      <div className="space-y-2 pt-1">
+                        <input
+                          type="password"
+                          value={resendApiKeyInput}
+                          onChange={(e) => setResendApiKeyInput(e.target.value)}
+                          placeholder="Resend API Key (re_...)"
+                          className="w-full px-3 py-2 bg-white border border-slate-300 rounded-lg font-mono text-slate-900"
+                        />
+                        <input
+                          type="email"
+                          value={senderFromEmailInput}
+                          onChange={(e) => setSenderFromEmailInput(e.target.value)}
+                          placeholder="Verified Sender Email (or leave blank for onboarding@resend.dev)"
+                          className="w-full px-3 py-2 bg-white border border-slate-300 rounded-lg text-slate-900"
+                        />
+                        <button
+                          type="button"
+                          disabled={isLoading}
+                          onClick={handleResendVerificationCode}
+                          className="w-full py-2 px-4 bg-[#047857] hover:bg-[#065F46] text-white font-bold rounded-lg cursor-pointer"
+                        >
+                          Save &amp; Dispatch Code via Resend API
+                        </button>
+                      </div>
+                    )}
+
+                    {gatewayProviderMode === 'sendgrid_api' && (
+                      <div className="space-y-2 pt-1">
+                        <input
+                          type="password"
+                          value={sendgridApiKeyInput}
+                          onChange={(e) => setSendgridApiKeyInput(e.target.value)}
+                          placeholder="SendGrid API Key (SG....)"
+                          className="w-full px-3 py-2 bg-white border border-slate-300 rounded-lg font-mono text-slate-900"
+                        />
+                        <input
+                          type="email"
+                          value={senderFromEmailInput}
+                          onChange={(e) => setSenderFromEmailInput(e.target.value)}
+                          placeholder="Verified Sender Email (e.g. security@yourdomain.com)"
+                          className="w-full px-3 py-2 bg-white border border-slate-300 rounded-lg text-slate-900"
+                        />
+                        <button
+                          type="button"
+                          disabled={isLoading}
+                          onClick={handleResendVerificationCode}
+                          className="w-full py-2 px-4 bg-[#047857] hover:bg-[#065F46] text-white font-bold rounded-lg cursor-pointer"
+                        >
+                          Save &amp; Dispatch Code via SendGrid API
+                        </button>
+                      </div>
+                    )}
+
+                    {gatewayProviderMode === 'smtp' && (
+                      <div className="space-y-2 pt-1">
+                        <div className="grid grid-cols-3 gap-2">
+                          <input
+                            type="text"
+                            value={smtpHostInput}
+                            onChange={(e) => setSmtpHostInput(e.target.value)}
+                            placeholder="SMTP Host (smtp.gmail.com)"
+                            className="col-span-2 px-3 py-2 bg-white border border-slate-300 rounded-lg font-mono text-slate-900"
+                          />
+                          <input
+                            type="text"
+                            value={smtpPortInput}
+                            onChange={(e) => setSmtpPortInput(e.target.value)}
+                            placeholder="Port (587)"
+                            className="px-3 py-2 bg-white border border-slate-300 rounded-lg font-mono text-slate-900"
+                          />
+                        </div>
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                          <input
+                            type="text"
+                            value={smtpUserInput}
+                            onChange={(e) => setSmtpUserInput(e.target.value)}
+                            placeholder="SMTP Username / Email"
+                            className="px-3 py-2 bg-white border border-slate-300 rounded-lg text-slate-900"
+                          />
+                          <input
+                            type="password"
+                            value={smtpPassInput}
+                            onChange={(e) => setSmtpPassInput(e.target.value)}
+                            placeholder="SMTP Password / App Password"
+                            className="px-3 py-2 bg-white border border-slate-300 rounded-lg text-slate-900"
+                          />
+                        </div>
+                        <button
+                          type="button"
+                          disabled={isLoading}
+                          onClick={handleResendVerificationCode}
+                          className="w-full py-2 px-4 bg-[#047857] hover:bg-[#065F46] text-white font-bold rounded-lg cursor-pointer"
+                        >
+                          Dispatch Verification Code via SMTP
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                )}
               </div>
             </div>
           )}
@@ -750,7 +980,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
             </form>
           )}
 
-          {/* MANUAL SIGN UP FORM (REQUIRES 6-DIGIT VERIFICATION CODE) */}
+          {/* MANUAL SIGN UP FORM (REQUIRES EMAIL-ONLY 6-DIGIT VERIFICATION CODE) */}
           {mode === 'signup' && (
             <form onSubmit={handleManualSignUp} className="space-y-4">
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
@@ -861,8 +1091,8 @@ export const AuthModal: React.FC<AuthModalProps> = ({
               >
                 <span>
                   {isLoading
-                    ? 'Sending 6-Digit Verification Code...'
-                    : 'Create Account & Send Verification Code'}
+                    ? 'Sending Verification Code to Email...'
+                    : 'Create Account & Email Verification Code'}
                 </span>
                 <ArrowRight className="w-4 h-4" />
               </button>
