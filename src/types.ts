@@ -72,6 +72,8 @@ export interface WorkflowNode {
   config: {
     // Messaging / Action parameters
     channel?: 'email' | 'whatsapp' | 'sms' | 'crm' | 'webhook';
+    senderIdentityId?: string;
+    overrideFromIdentity?: string;
     subjectOrTemplate?: string;
     messagePreview?: string;
     targetTag?: string;
