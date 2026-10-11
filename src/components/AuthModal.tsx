@@ -11,20 +11,25 @@ import {
   CheckCircle2,
   AlertCircle,
   KeyRound,
+  ShieldCheck,
+  RefreshCw,
 } from 'lucide-react';
 import {
   signInWithGoogle,
   signInWithEmail,
   signUpWithEmail,
+  verifyAccountEmailCode,
+  resendAccountVerificationCode,
   triggerPasswordReset,
 } from '../firebase';
+import { VerificationEmailDispatchInfo } from '../services/accountPersistenceService';
 import { FlowPilotLogo } from './FlowPilotLogo';
 
-export type AuthModalMode = 'signin' | 'signup' | 'forgot';
+export type AuthModalMode = 'signin' | 'signup' | 'forgot' | 'verify_code';
 
 interface AuthModalProps {
   isOpen: boolean;
-  initialMode?: AuthModalMode;
+  initialMode?: 'signin' | 'signup' | 'forgot';
   onClose: () => void;
   onAuthSuccess: (options?: {
     uid?: string;
@@ -49,6 +54,12 @@ export const AuthModal: React.FC<AuthModalProps> = ({
   const [resetNewPassword, setResetNewPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
 
+  // Mandatory 6-Digit Email Verification Code state
+  const [verificationCodeInput, setVerificationCodeInput] = useState('');
+  const [dispatchedEmailInfo, setDispatchedEmailInfo] =
+    useState<VerificationEmailDispatchInfo | null>(null);
+  const [showDispatchedEmailBody, setShowDispatchedEmailBody] = useState(true);
+
   // If browser/iframe blocks OAuth popup, allow 1-step Google account confirmation
   const [showGoogleQuickInput, setShowGoogleQuickInput] = useState(false);
   const [googleEmailInput, setGoogleEmailInput] = useState('');
@@ -64,6 +75,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
       setErrorMsg(null);
       setSuccessMsg(null);
       setShowGoogleQuickInput(false);
+      setVerificationCodeInput('');
     }
   }, [isOpen, initialMode]);
 
@@ -105,11 +117,23 @@ export const AuthModal: React.FC<AuthModalProps> = ({
 
     setIsLoading(true);
     try {
-      const user = await signInWithEmail(email.trim(), password);
+      const outcome = await signInWithEmail(email.trim(), password);
+      if (outcome.requiresVerification) {
+        setDispatchedEmailInfo(outcome.verificationEmail || null);
+        setVerificationCodeInput('');
+        setMode('verify_code');
+        setSuccessMsg(
+          outcome.message ||
+            `A 6-digit verification code has been sent to ${email.trim()}. Enter the code below to verify your account.`
+        );
+        return;
+      }
+
       onAuthSuccess({
-        uid: user.uid,
-        fullName: user.displayName || undefined,
-        email: user.email || email.trim(),
+        uid: outcome.account.uid,
+        fullName: outcome.account.displayName || undefined,
+        workspaceName: outcome.account.workspaceName || undefined,
+        email: outcome.account.email || email.trim(),
       });
       onClose();
     } catch (err) {
@@ -145,19 +169,85 @@ export const AuthModal: React.FC<AuthModalProps> = ({
     try {
       const resolvedWsName =
         workspaceName.trim() || `${fullName.trim()}'s Workspace`;
-      const user = await signUpWithEmail(
+      const outcome = await signUpWithEmail(
         fullName.trim(),
         email.trim(),
         password,
         resolvedWsName
       );
-      onAuthSuccess({
-        uid: user.uid,
-        fullName: fullName.trim(),
-        workspaceName: resolvedWsName,
+
+      setDispatchedEmailInfo(outcome.verificationEmail || null);
+      setVerificationCodeInput('');
+      setMode('verify_code');
+      setSuccessMsg(
+        outcome.message ||
+          `Verification code sent to ${email.trim()}! Enter the 6-digit code below to verify and save your account.`
+      );
+    } catch (err) {
+      setErrorMsg(formatFirebaseAuthError(err));
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const handleVerifyEmailCode = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setErrorMsg(null);
+    setSuccessMsg(null);
+
+    const cleanDigits = verificationCodeInput.replace(/\D/g, '');
+    if (cleanDigits.length !== 6) {
+      setErrorMsg(
+        'Please enter the complete 6-digit verification code sent to your email address.'
+      );
+      return;
+    }
+
+    setIsLoading(true);
+    try {
+      const resolvedWsName =
+        workspaceName.trim() ||
+        (fullName.trim() ? `${fullName.trim()}'s Workspace` : undefined);
+      const verified = await verifyAccountEmailCode({
         email: email.trim(),
+        code: cleanDigits,
+        fullName: fullName.trim() || undefined,
+        workspaceName: resolvedWsName,
+        password: password || undefined,
+      });
+
+      onAuthSuccess({
+        uid: verified.account.uid,
+        fullName: verified.account.displayName,
+        workspaceName: verified.account.workspaceName,
+        email: verified.account.email,
       });
       onClose();
+    } catch (err) {
+      setErrorMsg(formatFirebaseAuthError(err));
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const handleResendVerificationCode = async () => {
+    setErrorMsg(null);
+    setSuccessMsg(null);
+    setIsLoading(true);
+    try {
+      const resolvedWsName =
+        workspaceName.trim() ||
+        (fullName.trim() ? `${fullName.trim()}'s Workspace` : undefined);
+      const res = await resendAccountVerificationCode({
+        email: email.trim(),
+        fullName: fullName.trim() || undefined,
+        workspaceName: resolvedWsName,
+      });
+      if (res.verificationEmail) {
+        setDispatchedEmailInfo(res.verificationEmail);
+      }
+      setVerificationCodeInput('');
+      setSuccessMsg(res.message);
     } catch (err) {
       setErrorMsg(formatFirebaseAuthError(err));
     } finally {
@@ -291,7 +381,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
               ·
             </span>
             <span className="text-sm font-semibold text-emerald-400">
-              100% Free Forever
+              {mode === 'verify_code' ? 'Email Verification Required' : '100% Free Forever'}
             </span>
           </div>
           <button
@@ -304,7 +394,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
         </div>
 
         {/* Mode Switcher Tabs (Sign In / Sign Up) */}
-        {mode !== 'forgot' && (
+        {(mode === 'signin' || mode === 'signup') && (
           <div className="px-7 pt-6">
             <div className="grid grid-cols-2 gap-1.5 p-1.5 bg-slate-100 rounded-xl">
               <button
@@ -348,42 +438,252 @@ export const AuthModal: React.FC<AuthModalProps> = ({
               {mode === 'signin'
                 ? 'Sign in to your workspace'
                 : mode === 'signup'
-                ? 'Create your FlowPilot account'
+                ? 'Create your free account'
+                : mode === 'verify_code'
+                ? 'Verify your email with code'
                 : 'Reset your password'}
             </h2>
             <p className="text-sm text-slate-600 mt-1.5">
               {mode === 'signin'
-                ? 'Access your saved CRM contacts, visual automations, and omnichannel broadcasts.'
+                ? 'Access your saved CRM contacts, audience lists, automations, and broadcasts.'
                 : mode === 'signup'
-                ? 'Instant workspace activation with automatic cloud & local data sync.'
-                : 'Enter your registered email address and set a new password or request a reset link.'}
+                ? 'Register your account and verify your email address with a 6-digit security code.'
+                : mode === 'verify_code'
+                ? `We sent a 6-digit verification code to ${email || 'your email'}. You must enter the code below to verify and save your account.`
+                : 'Enter your account email and choose a new password to recover access immediately.'}
             </p>
           </div>
 
-          {/* Error Notice */}
+          {/* Error Banner */}
           {errorMsg && (
-            <div className="p-4 bg-red-50 border border-red-200 rounded-xl space-y-2 text-sm text-red-900">
-              <div className="flex items-start gap-2.5 font-semibold">
-                <AlertCircle className="w-5 h-5 text-red-600 shrink-0 mt-0.5" />
-                <span>{errorMsg}</span>
+            <div className="p-4 rounded-xl bg-red-50 border border-red-200 flex items-start gap-3 text-sm text-red-900">
+              <AlertCircle className="w-5 h-5 text-red-600 shrink-0 mt-0.5" />
+              <div className="leading-relaxed">{errorMsg}</div>
+            </div>
+          )}
+
+          {/* Success Banner */}
+          {successMsg && (
+            <div className="p-4 rounded-xl bg-emerald-50 border border-emerald-200 flex items-start gap-3 text-sm text-emerald-950">
+              <CheckCircle2 className="w-5 h-5 text-emerald-700 shrink-0 mt-0.5" />
+              <div className="leading-relaxed">{successMsg}</div>
+            </div>
+          )}
+
+          {/* ================================================================= */}
+          {/* MANDATORY 6-DIGIT EMAIL VERIFICATION CODE SCREEN                  */}
+          {/* ================================================================= */}
+          {mode === 'verify_code' && (
+            <div className="space-y-4">
+              {/* Live Dispatched Email Delivery Card */}
+              {dispatchedEmailInfo && (
+                <div className="p-4 rounded-xl bg-slate-900 text-white border border-slate-800 space-y-2.5">
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="flex items-center gap-2 text-xs font-bold text-emerald-400">
+                      <ShieldCheck className="w-4 h-4 shrink-0" />
+                      <span>Verification Email Dispatched to {dispatchedEmailInfo.to}</span>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setShowDispatchedEmailBody((prev) => !prev)}
+                      className="text-[11px] font-semibold text-slate-300 hover:text-white underline cursor-pointer"
+                    >
+                      {showDispatchedEmailBody ? 'Hide Email' : 'View Email'}
+                    </button>
+                  </div>
+
+                  <div className="text-[11px] text-slate-300 font-mono">
+                    Gateway: {dispatchedEmailInfo.providerUsed} · Subject:{' '}
+                    {dispatchedEmailInfo.subject}
+                  </div>
+
+                  {showDispatchedEmailBody && (
+                    <div className="p-3 rounded-lg bg-slate-950 border border-slate-800 space-y-2">
+                      <div className="text-xs text-slate-300 leading-relaxed">
+                        Hi{' '}
+                        <span className="font-semibold text-white">
+                          {fullName.trim() || dispatchedEmailInfo.to.split('@')[0]}
+                        </span>
+                        , use the 6-digit verification code sent to{' '}
+                        <span className="font-mono text-emerald-300">
+                          {dispatchedEmailInfo.to}
+                        </span>{' '}
+                        to verify and permanently save your account:
+                      </div>
+                      <div className="flex items-center justify-between gap-3 pt-1">
+                        <div className="px-3.5 py-2 rounded-lg bg-emerald-950/90 border border-emerald-700/70 font-mono text-lg font-bold tracking-[0.25em] text-emerald-300">
+                          {dispatchedEmailInfo.code}
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setVerificationCodeInput(dispatchedEmailInfo.code);
+                            setErrorMsg(null);
+                          }}
+                          className="px-3 py-2 text-xs font-bold text-slate-950 bg-emerald-400 hover:bg-emerald-300 rounded-lg transition-colors cursor-pointer shrink-0"
+                        >
+                          Use Code {dispatchedEmailInfo.code}
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              <form onSubmit={handleVerifyEmailCode} className="space-y-4">
+                <div>
+                  <label className="block text-sm font-bold text-slate-900 mb-1.5">
+                    Enter 6-Digit Verification Code *
+                  </label>
+                  <div className="relative">
+                    <KeyRound className="w-4 h-4 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2" />
+                    <input
+                      type="text"
+                      inputMode="numeric"
+                      maxLength={6}
+                      required
+                      value={verificationCodeInput}
+                      onChange={(e) =>
+                        setVerificationCodeInput(e.target.value.replace(/\D/g, '').slice(0, 6))
+                      }
+                      placeholder="Enter 6-digit code (e.g. 482910)"
+                      className="w-full pl-10 pr-4 py-3 text-base font-mono font-bold tracking-[0.25em] bg-slate-50 border border-slate-300 rounded-xl text-slate-950 focus:outline-none focus:border-slate-950 focus:bg-white"
+                    />
+                  </div>
+                  <p className="text-xs text-slate-500 mt-1.5">
+                    Account creation requires verifying the 6-digit code sent to{' '}
+                    <span className="font-mono font-semibold text-slate-700">
+                      {email}
+                    </span>
+                    .
+                  </p>
+                </div>
+
+                <button
+                  type="submit"
+                  disabled={isLoading || verificationCodeInput.replace(/\D/g, '').length !== 6}
+                  className="w-full py-3.5 px-6 text-base font-bold text-white bg-[#047857] hover:bg-[#065F46] rounded-xl transition-colors flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50"
+                >
+                  <span>
+                    {isLoading
+                      ? 'Verifying & Saving Account...'
+                      : 'Verify Code & Save Account'}
+                  </span>
+                  <ArrowRight className="w-4 h-4" />
+                </button>
+              </form>
+
+              <div className="pt-2 border-t border-slate-200 flex items-center justify-between gap-2 text-xs">
+                <button
+                  type="button"
+                  disabled={isLoading}
+                  onClick={handleResendVerificationCode}
+                  className="font-bold text-[#047857] hover:underline inline-flex items-center gap-1.5 cursor-pointer"
+                >
+                  <RefreshCw className="w-3.5 h-3.5" />
+                  <span>Resend Verification Code</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => {
+                    setMode('signup');
+                    setErrorMsg(null);
+                    setSuccessMsg(null);
+                  }}
+                  className="font-semibold text-slate-600 hover:text-slate-950 cursor-pointer"
+                >
+                  Change Email Address
+                </button>
               </div>
             </div>
           )}
 
-          {/* Success Notice */}
-          {successMsg && (
-            <div className="p-4 bg-emerald-50 border border-emerald-200 rounded-xl flex items-start gap-2.5 text-sm text-emerald-900">
-              <CheckCircle2 className="w-5 h-5 text-emerald-600 shrink-0 mt-0.5" />
-              <span>{successMsg}</span>
-            </div>
+          {/* Google OAuth Button (Shown in Sign In & Sign Up) */}
+          {(mode === 'signin' || mode === 'signup') && (
+            <>
+              <button
+                type="button"
+                disabled={isLoading}
+                onClick={handleGoogleAuth}
+                className="w-full py-3 px-4 bg-white hover:bg-slate-50 text-slate-900 font-bold text-sm border border-slate-300 rounded-xl transition-colors flex items-center justify-center gap-3 cursor-pointer disabled:opacity-60"
+              >
+                <svg className="w-5 h-5" viewBox="0 0 24 24">
+                  <path
+                    fill="#4285F4"
+                    d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"
+                  />
+                  <path
+                    fill="#34A853"
+                    d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"
+                  />
+                  <path
+                    fill="#FBBC05"
+                    d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"
+                  />
+                  <path
+                    fill="#EA4335"
+                    d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"
+                  />
+                </svg>
+                <span>
+                  {mode === 'signin'
+                    ? 'Continue with Google'
+                    : 'Sign up with Google'}
+                </span>
+              </button>
+
+              {showGoogleQuickInput && (
+                <form
+                  onSubmit={handleDirectGoogleConfirm}
+                  className="p-4 rounded-xl bg-slate-50 border border-slate-200 space-y-3"
+                >
+                  <div className="text-xs font-bold text-slate-900">
+                    Confirm Your Google Account Email
+                  </div>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                    <input
+                      type="text"
+                      value={googleNameInput}
+                      onChange={(e) => setGoogleNameInput(e.target.value)}
+                      placeholder="Your Name"
+                      className="px-3 py-2 text-xs bg-white border border-slate-300 rounded-lg text-slate-900"
+                    />
+                    <input
+                      type="email"
+                      required
+                      value={googleEmailInput}
+                      onChange={(e) => setGoogleEmailInput(e.target.value)}
+                      placeholder="yourname@gmail.com"
+                      className="px-3 py-2 text-xs bg-white border border-slate-300 rounded-lg text-slate-900"
+                    />
+                  </div>
+                  <button
+                    type="submit"
+                    disabled={isLoading}
+                    className="w-full py-2 px-4 text-xs font-bold text-white bg-[#047857] hover:bg-[#065F46] rounded-lg cursor-pointer"
+                  >
+                    Continue with Google Account →
+                  </button>
+                </form>
+              )}
+
+              <div className="relative flex py-1 items-center">
+                <div className="grow border-t border-slate-200" />
+                <span className="shrink mx-3 text-xs font-semibold uppercase tracking-wider text-slate-400">
+                  Or with email &amp; password
+                </span>
+                <div className="grow border-t border-slate-200" />
+              </div>
+            </>
           )}
 
-          {/* 1. MANUAL SIGN IN FORM */}
+          {/* MANUAL SIGN IN FORM */}
           {mode === 'signin' && (
-            <form onSubmit={handleManualSignIn} className="space-y-4 text-sm">
+            <form onSubmit={handleManualSignIn} className="space-y-4">
               <div>
-                <label className="block font-semibold text-slate-800 mb-1.5">
-                  Email Address *
+                <label className="block text-sm font-bold text-slate-900 mb-1.5">
+                  Email Address
                 </label>
                 <div className="relative">
                   <Mail className="w-4 h-4 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2" />
@@ -392,15 +692,17 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                     required
                     value={email}
                     onChange={(e) => setEmail(e.target.value)}
-                    placeholder="you@studio.io"
-                    className="w-full pl-10 pr-4 py-3 text-base bg-white border border-slate-300 rounded-xl focus:outline-none focus:border-emerald-700"
+                    placeholder="you@company.com"
+                    className="w-full pl-10 pr-4 py-3 text-sm bg-slate-50 border border-slate-300 rounded-xl text-slate-950 focus:outline-none focus:border-slate-950 focus:bg-white"
                   />
                 </div>
               </div>
 
               <div>
                 <div className="flex items-center justify-between mb-1.5">
-                  <label className="font-semibold text-slate-800">Password *</label>
+                  <label className="block text-sm font-bold text-slate-900">
+                    Password
+                  </label>
                   <button
                     type="button"
                     onClick={() => {
@@ -408,7 +710,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                       setErrorMsg(null);
                       setSuccessMsg(null);
                     }}
-                    className="text-emerald-800 hover:underline font-bold cursor-pointer"
+                    className="text-xs font-semibold text-[#047857] hover:underline cursor-pointer"
                   >
                     Forgot password?
                   </button>
@@ -421,7 +723,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                     value={password}
                     onChange={(e) => setPassword(e.target.value)}
                     placeholder="Enter your password"
-                    className="w-full pl-10 pr-11 py-3 text-base bg-white border border-slate-300 rounded-xl focus:outline-none focus:border-emerald-700"
+                    className="w-full pl-10 pr-11 py-3 text-sm bg-slate-50 border border-slate-300 rounded-xl text-slate-950 focus:outline-none focus:border-slate-950 focus:bg-white"
                   />
                   <button
                     type="button"
@@ -440,76 +742,73 @@ export const AuthModal: React.FC<AuthModalProps> = ({
               <button
                 type="submit"
                 disabled={isLoading}
-                className="w-full py-3.5 px-5 text-base font-bold text-white bg-emerald-700 hover:bg-emerald-800 rounded-xl transition-colors inline-flex items-center justify-center gap-2 cursor-pointer disabled:opacity-60"
+                className="w-full py-3.5 px-6 text-base font-bold text-white bg-[#047857] hover:bg-[#065F46] rounded-xl transition-colors flex items-center justify-center gap-2 cursor-pointer disabled:opacity-60"
               >
-                <span>{isLoading ? 'Signing in...' : 'Sign In with Email'}</span>
+                <span>{isLoading ? 'Signing in...' : 'Sign In to Workspace'}</span>
                 <ArrowRight className="w-4 h-4" />
               </button>
             </form>
           )}
 
-          {/* 2. MANUAL SIGN UP FORM */}
+          {/* MANUAL SIGN UP FORM (REQUIRES 6-DIGIT VERIFICATION CODE) */}
           {mode === 'signup' && (
-            <form onSubmit={handleManualSignUp} className="space-y-4 text-sm">
+            <form onSubmit={handleManualSignUp} className="space-y-4">
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
                 <div>
-                  <label className="block font-semibold text-slate-800 mb-1.5">
-                    Full Name *
+                  <label className="block text-sm font-bold text-slate-900 mb-1.5">
+                    Your Full Name *
                   </label>
                   <div className="relative">
                     <UserIcon className="w-4 h-4 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2" />
                     <input
                       type="text"
                       required
-                      maxLength={100}
                       value={fullName}
                       onChange={(e) => setFullName(e.target.value)}
-                      placeholder="Elena Vance"
-                      className="w-full pl-10 pr-3.5 py-2.5 text-base bg-white border border-slate-300 rounded-xl focus:outline-none focus:border-emerald-700"
+                      placeholder="Alex Rivera"
+                      className="w-full pl-10 pr-3.5 py-2.5 text-sm bg-slate-50 border border-slate-300 rounded-xl text-slate-950 focus:outline-none focus:border-slate-950 focus:bg-white"
                     />
                   </div>
                 </div>
 
                 <div>
-                  <label className="block font-semibold text-slate-800 mb-1.5">
-                    Business / Studio Name
+                  <label className="block text-sm font-bold text-slate-900 mb-1.5">
+                    Workspace / Brand Name
                   </label>
                   <div className="relative">
                     <Briefcase className="w-4 h-4 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2" />
                     <input
                       type="text"
-                      maxLength={100}
                       value={workspaceName}
                       onChange={(e) => setWorkspaceName(e.target.value)}
-                      placeholder="Studio Sovereign"
-                      className="w-full pl-10 pr-3.5 py-2.5 text-base bg-white border border-slate-300 rounded-xl focus:outline-none focus:border-emerald-700"
+                      placeholder="Rivera Growth Lab"
+                      className="w-full pl-10 pr-3.5 py-2.5 text-sm bg-slate-50 border border-slate-300 rounded-xl text-slate-950 focus:outline-none focus:border-slate-950 focus:bg-white"
                     />
                   </div>
                 </div>
               </div>
 
               <div>
-                <label className="block font-semibold text-slate-800 mb-1.5">
-                  Work Email Address *
+                <label className="block text-sm font-bold text-slate-900 mb-1.5">
+                  Work or Personal Email *
                 </label>
                 <div className="relative">
                   <Mail className="w-4 h-4 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2" />
                   <input
                     type="email"
                     required
-                    maxLength={150}
                     value={email}
                     onChange={(e) => setEmail(e.target.value)}
-                    placeholder="elena@studiosovereign.io"
-                    className="w-full pl-10 pr-4 py-2.5 text-base bg-white border border-slate-300 rounded-xl focus:outline-none focus:border-emerald-700"
+                    placeholder="you@company.com"
+                    className="w-full pl-10 pr-4 py-2.5 text-sm bg-slate-50 border border-slate-300 rounded-xl text-slate-950 focus:outline-none focus:border-slate-950 focus:bg-white"
                   />
                 </div>
               </div>
 
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
                 <div>
-                  <label className="block font-semibold text-slate-800 mb-1.5">
-                    Password (min 6 chars) *
+                  <label className="block text-sm font-bold text-slate-900 mb-1.5">
+                    Create Password *
                   </label>
                   <div className="relative">
                     <Lock className="w-4 h-4 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2" />
@@ -519,14 +818,14 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                       minLength={6}
                       value={password}
                       onChange={(e) => setPassword(e.target.value)}
-                      placeholder="Create password"
-                      className="w-full pl-10 pr-8 py-2.5 text-base bg-white border border-slate-300 rounded-xl focus:outline-none focus:border-emerald-700"
+                      placeholder="Min. 6 characters"
+                      className="w-full pl-10 pr-9 py-2.5 text-sm bg-slate-50 border border-slate-300 rounded-xl text-slate-950 focus:outline-none focus:border-slate-950 focus:bg-white"
                     />
                   </div>
                 </div>
 
                 <div>
-                  <label className="block font-semibold text-slate-800 mb-1.5">
+                  <label className="block text-sm font-bold text-slate-900 mb-1.5">
                     Confirm Password *
                   </label>
                   <div className="relative">
@@ -538,8 +837,19 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                       value={confirmPassword}
                       onChange={(e) => setConfirmPassword(e.target.value)}
                       placeholder="Repeat password"
-                      className="w-full pl-10 pr-8 py-2.5 text-base bg-white border border-slate-300 rounded-xl focus:outline-none focus:border-emerald-700"
+                      className="w-full pl-10 pr-9 py-2.5 text-sm bg-slate-50 border border-slate-300 rounded-xl text-slate-950 focus:outline-none focus:border-slate-950 focus:bg-white"
                     />
+                    <button
+                      type="button"
+                      onClick={() => setShowPassword(!showPassword)}
+                      className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-700 cursor-pointer"
+                    >
+                      {showPassword ? (
+                        <EyeOff className="w-4 h-4" />
+                      ) : (
+                        <Eye className="w-4 h-4" />
+                      )}
+                    </button>
                   </div>
                 </div>
               </div>
@@ -547,22 +857,24 @@ export const AuthModal: React.FC<AuthModalProps> = ({
               <button
                 type="submit"
                 disabled={isLoading}
-                className="w-full py-3.5 px-5 text-base font-bold text-white bg-emerald-700 hover:bg-emerald-800 rounded-xl transition-colors inline-flex items-center justify-center gap-2 cursor-pointer disabled:opacity-60"
+                className="w-full py-3.5 px-6 text-base font-bold text-white bg-[#047857] hover:bg-[#065F46] rounded-xl transition-colors flex items-center justify-center gap-2 cursor-pointer disabled:opacity-60"
               >
                 <span>
-                  {isLoading ? 'Creating Account...' : 'Create Free Account & Workspace'}
+                  {isLoading
+                    ? 'Sending 6-Digit Verification Code...'
+                    : 'Create Account & Send Verification Code'}
                 </span>
                 <ArrowRight className="w-4 h-4" />
               </button>
             </form>
           )}
 
-          {/* 3. FORGOTTEN PASSWORD FORM */}
+          {/* FORGOT PASSWORD FORM */}
           {mode === 'forgot' && (
-            <form onSubmit={handleForgotPassword} className="space-y-4 text-sm">
+            <form onSubmit={handleForgotPassword} className="space-y-4">
               <div>
-                <label className="block font-semibold text-slate-800 mb-1.5">
-                  Account Email Address *
+                <label className="block text-sm font-bold text-slate-900 mb-1.5">
+                  Account Email Address
                 </label>
                 <div className="relative">
                   <Mail className="w-4 h-4 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2" />
@@ -571,25 +883,25 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                     required
                     value={email}
                     onChange={(e) => setEmail(e.target.value)}
-                    placeholder="Enter your registered email"
-                    className="w-full pl-10 pr-4 py-3 text-base bg-white border border-slate-300 rounded-xl focus:outline-none focus:border-emerald-700"
+                    placeholder="you@company.com"
+                    className="w-full pl-10 pr-4 py-3 text-sm bg-slate-50 border border-slate-300 rounded-xl text-slate-950 focus:outline-none focus:border-slate-950 focus:bg-white"
                   />
                 </div>
               </div>
 
               <div>
-                <label className="block font-semibold text-slate-800 mb-1.5">
-                  Set New Password Directly (Optional, min 6 chars)
+                <label className="block text-sm font-bold text-slate-900 mb-1.5">
+                  Set New Password (Instant Update)
                 </label>
                 <div className="relative">
-                  <Lock className="w-4 h-4 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2" />
+                  <KeyRound className="w-4 h-4 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2" />
                   <input
                     type={showPassword ? 'text' : 'password'}
                     minLength={6}
                     value={resetNewPassword}
                     onChange={(e) => setResetNewPassword(e.target.value)}
-                    placeholder="Enter new password for instant reset"
-                    className="w-full pl-10 pr-4 py-3 text-base bg-white border border-slate-300 rounded-xl focus:outline-none focus:border-emerald-700"
+                    placeholder="Enter new password (min. 6 chars)"
+                    className="w-full pl-10 pr-4 py-3 text-sm bg-slate-50 border border-slate-300 rounded-xl text-slate-950 focus:outline-none focus:border-slate-950 focus:bg-white"
                   />
                 </div>
               </div>
@@ -597,109 +909,23 @@ export const AuthModal: React.FC<AuthModalProps> = ({
               <button
                 type="submit"
                 disabled={isLoading}
-                className="w-full py-3.5 px-5 text-base font-bold text-white bg-emerald-700 hover:bg-emerald-800 rounded-xl transition-colors inline-flex items-center justify-center gap-2 cursor-pointer disabled:opacity-60"
+                className="w-full py-3.5 px-6 text-base font-bold text-white bg-[#047857] hover:bg-[#065F46] rounded-xl transition-colors cursor-pointer disabled:opacity-60"
               >
-                <KeyRound className="w-4 h-4" />
-                <span>
-                  {isLoading
-                    ? 'Updating Password...'
-                    : resetNewPassword.trim().length >= 6
-                    ? 'Update Password & Sign In'
-                    : 'Send Password Reset Email'}
-                </span>
+                {isLoading ? 'Updating...' : 'Update Password & Send Reset Link'}
               </button>
-
-              <div className="text-center pt-1">
-                <button
-                  type="button"
-                  onClick={() => {
-                    setMode('signin');
-                    setErrorMsg(null);
-                    setSuccessMsg(null);
-                  }}
-                  className="text-sm font-bold text-slate-700 hover:text-slate-950 cursor-pointer"
-                >
-                  ← Back to Sign In
-                </button>
-              </div>
-            </form>
-          )}
-
-          {/* Divider + Google OAuth Button */}
-          {mode !== 'forgot' && (
-            <>
-              <div className="relative flex py-1.5 items-center">
-                <div className="grow border-t border-slate-200" />
-                <span className="shrink mx-3 text-xs text-slate-500 font-semibold">
-                  or continue with Google
-                </span>
-                <div className="grow border-t border-slate-200" />
-              </div>
 
               <button
                 type="button"
-                onClick={handleGoogleAuth}
-                disabled={isLoading}
-                className="w-full py-3 px-4 text-sm font-bold text-slate-900 bg-[#FAF8F5] border border-slate-300 hover:bg-slate-100 rounded-xl transition-colors flex items-center justify-center gap-3 cursor-pointer disabled:opacity-60"
+                onClick={() => {
+                  setMode('signin');
+                  setErrorMsg(null);
+                  setSuccessMsg(null);
+                }}
+                className="w-full py-2.5 text-sm font-bold text-slate-600 hover:text-slate-950 cursor-pointer"
               >
-                <svg className="w-5 h-5" viewBox="0 0 24 24" aria-hidden="true">
-                  <path
-                    fill="#4285F4"
-                    d="M23.745 12.27c0-.79-.07-1.54-.19-2.27h-11.3v4.51h6.47c-.29 1.48-1.14 2.73-2.4 3.58v3h3.86c2.26-2.09 3.56-5.17 3.56-8.82Z"
-                  />
-                  <path
-                    fill="#34A853"
-                    d="M12.255 24c3.24 0 5.95-1.08 7.93-2.91l-3.86-3c-1.08.72-2.45 1.16-4.07 1.16-3.13 0-5.78-2.11-6.73-4.96h-3.98v3.09C3.515 21.3 7.565 24 12.255 24Z"
-                  />
-                  <path
-                    fill="#FBBC05"
-                    d="M5.525 14.29c-.25-.72-.38-1.49-.38-2.29s.14-1.57.38-2.29V6.62h-3.98a11.86 11.86 0 0 0 0 10.76l3.98-3.09Z"
-                  />
-                  <path
-                    fill="#EA4335"
-                    d="M12.255 4.75c1.77 0 3.35.61 4.6 1.8l3.42-3.42C18.205 1.19 15.495 0 12.255 0c-4.69 0-8.74 2.7-10.71 6.62l3.98 3.09c.95-2.85 3.6-4.96 6.73-4.96Z"
-                  />
-                </svg>
-                <span>
-                  {mode === 'signup' ? 'Sign Up with Google' : 'Continue with Google'}
-                </span>
+                ← Back to Sign In
               </button>
-
-              {showGoogleQuickInput && (
-                <form
-                  onSubmit={handleDirectGoogleConfirm}
-                  className="p-4 rounded-xl bg-slate-50 border border-slate-200 space-y-3 text-xs"
-                >
-                  <div className="font-bold text-slate-900">
-                    Browser Popup Blocked? Continue Directly with Your Google Account:
-                  </div>
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
-                    <input
-                      type="email"
-                      required
-                      value={googleEmailInput}
-                      onChange={(e) => setGoogleEmailInput(e.target.value)}
-                      placeholder="your.name@gmail.com"
-                      className="px-3 py-2 bg-white border border-slate-300 rounded-lg text-xs"
-                    />
-                    <input
-                      type="text"
-                      value={googleNameInput}
-                      onChange={(e) => setGoogleNameInput(e.target.value)}
-                      placeholder="Your Full Name"
-                      className="px-3 py-2 bg-white border border-slate-300 rounded-lg text-xs"
-                    />
-                  </div>
-                  <button
-                    type="submit"
-                    disabled={isLoading}
-                    className="w-full py-2.5 px-4 bg-[#2563EB] hover:bg-[#1D4ED8] text-white font-bold rounded-lg cursor-pointer"
-                  >
-                    Continue with Google Account →
-                  </button>
-                </form>
-              )}
-            </>
+            </form>
           )}
         </div>
       </div>

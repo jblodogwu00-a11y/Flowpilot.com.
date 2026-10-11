@@ -1,6 +1,6 @@
 {
-  "summary":  "Implementation plan for fixing Manual Email/Password and Google authentication, enabling instant dual-sync workspace persistence (Cloud Firestore + local/server account storage), and ensuring end-to-end reliability across the multi-channel messaging engine.",
-  "updatedAt":  "2026-10-11T11:49:38.750406578Z",
+  "summary":  "Implementation plan for adding A/B Split Testing & Send-Time Optimization, Revenue Attribution & Conversion ROI Analytics, Visual Multi-Channel Template Studio with Deliverability Checker, Full Workspace Backup Export/Import & Webhook Inspector, and resolving the Cloud Firestore WebChannel timeout notice.",
+  "updatedAt":  "2026-10-11T13:20:37.633692166Z",
   "requestFeedback":  true,
   "userFacing":  true
 }

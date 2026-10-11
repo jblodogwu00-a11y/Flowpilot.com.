@@ -20,8 +20,11 @@ import {
 import firebaseConfig from '../firebase-applet-config.json';
 import {
   ActiveAccountSession,
+  VerificationEmailDispatchInfo,
+  WorkspaceSnapshot,
   getStoredActiveAccountSession,
   saveStoredActiveAccountSession,
+  isEmailVerifiedInLocalRegistry,
   syncAccountWithServer,
 } from './services/accountPersistenceService';
 
@@ -48,13 +51,14 @@ export const firebaseProjectId = firebaseConfig.projectId;
 // Auth session listeners (unified across Firebase Auth + Persistent Account Store)
 type SessionListener = (user: User | null, session: ActiveAccountSession | null) => void;
 const authSessionListeners = new Set<SessionListener>();
+let isPendingVerificationFlow = false;
 
-function createSyntheticFirebaseUser(session: ActiveAccountSession): User {
+export function createSyntheticFirebaseUser(session: ActiveAccountSession): User {
   return {
     uid: session.uid,
     email: session.email,
     displayName: session.displayName,
-    emailVerified: true,
+    emailVerified: session.emailVerified,
     isAnonymous: false,
     metadata: {},
     providerData: [
@@ -78,14 +82,14 @@ function createSyntheticFirebaseUser(session: ActiveAccountSession): User {
       expirationTime: new Date(Date.now() + 86400000).toISOString(),
       signInProvider: session.provider,
       signInSecondFactor: null,
-      claims: { email: session.email, email_verified: true },
+      claims: { email: session.email, email_verified: session.emailVerified },
     }),
     reload: async () => {},
     toJSON: () => ({
       uid: session.uid,
       email: session.email,
       displayName: session.displayName,
-      emailVerified: true,
+      emailVerified: session.emailVerified,
     }),
     phoneNumber: null,
     photoURL: null,
@@ -103,17 +107,18 @@ export function notifyAuthSessionChanged(
   let effectiveUser: User | null = firebaseUser;
   let effectiveSession: ActiveAccountSession | null = storedSession;
 
-  if (firebaseUser) {
+  if (firebaseUser && storedSession && storedSession.emailVerified) {
     effectiveSession = {
       uid: firebaseUser.uid,
-      email: firebaseUser.email || storedSession?.email || 'operator@flowpilot.app',
+      email: firebaseUser.email || storedSession.email || 'operator@flowpilot.app',
       displayName:
+        storedSession.displayName ||
         firebaseUser.displayName ||
-        storedSession?.displayName ||
         (firebaseUser.email ? firebaseUser.email.split('@')[0] : 'Workspace Owner'),
       workspaceName:
-        storedSession?.workspaceName ||
+        storedSession.workspaceName ||
         `${
+          storedSession.displayName ||
           firebaseUser.displayName ||
           (firebaseUser.email ? firebaseUser.email.split('@')[0] : 'My')
         }'s Workspace`,
@@ -125,8 +130,11 @@ export function notifyAuthSessionChanged(
       isFirebaseUser: true,
     };
     saveStoredActiveAccountSession(effectiveSession);
-  } else if (storedSession) {
+  } else if (storedSession && storedSession.emailVerified) {
     effectiveUser = createSyntheticFirebaseUser(storedSession);
+  } else {
+    effectiveUser = null;
+    effectiveSession = null;
   }
 
   authSessionListeners.forEach((listener) => {
@@ -141,17 +149,53 @@ export function notifyAuthSessionChanged(
 export function subscribeUnifiedAuthState(listener: SessionListener): () => void {
   authSessionListeners.add(listener);
 
-  // Also subscribe to underlying Firebase Auth
+  // Immediately emit stored verified session if available
+  const initialStored = getStoredActiveAccountSession();
+  if (initialStored && initialStored.emailVerified) {
+    listener(
+      auth.currentUser || createSyntheticFirebaseUser(initialStored),
+      initialStored
+    );
+  }
+
+  // Subscribe to underlying Firebase Auth
   const unsubFirebase = onAuthStateChanged(auth, (fbUser) => {
+    if (isPendingVerificationFlow) {
+      return;
+    }
+    const saved = getStoredActiveAccountSession();
     if (fbUser) {
-      notifyAuthSessionChanged(fbUser);
-    } else {
-      const saved = getStoredActiveAccountSession();
-      if (saved) {
-        listener(createSyntheticFirebaseUser(saved), saved);
+      const isGoogleProvider =
+        fbUser.providerData?.[0]?.providerId === 'google.com';
+      const isVerifiedLocally =
+        Boolean(saved && saved.emailVerified) ||
+        (fbUser.email ? isEmailVerifiedInLocalRegistry(fbUser.email) : false);
+
+      if (isGoogleProvider || isVerifiedLocally) {
+        const activeSession: ActiveAccountSession = saved || {
+          uid: fbUser.uid,
+          email: fbUser.email || 'operator@flowpilot.app',
+          displayName:
+            fbUser.displayName ||
+            (fbUser.email ? fbUser.email.split('@')[0] : 'Workspace Owner'),
+          workspaceName: `${
+            fbUser.displayName ||
+            (fbUser.email ? fbUser.email.split('@')[0] : 'My')
+          }'s Workspace`,
+          provider: isGoogleProvider ? 'google.com' : 'password',
+          emailVerified: true,
+          isFirebaseUser: true,
+        };
+        saveStoredActiveAccountSession(activeSession);
+        notifyAuthSessionChanged(fbUser, activeSession);
       } else {
+        // Unverified password account must complete the 6-digit verification code step first
         listener(null, null);
       }
+    } else if (saved && saved.emailVerified) {
+      listener(createSyntheticFirebaseUser(saved), saved);
+    } else {
+      listener(null, null);
     }
   });
 
@@ -279,7 +323,6 @@ export function handleFirestoreError(
     operationType,
     path,
   };
-  // Log diagnostic info without crashing the UI since Dual-Sync local + server storage preserves all data
   console.warn('Firestore Sync Notice: ', JSON.stringify(errInfo));
 }
 
@@ -324,7 +367,6 @@ export async function signInWithGoogle(fallbackAccountHint?: {
     return result.user;
   } catch (err) {
     const rawMsg = err instanceof Error ? err.message : String(err);
-    // If user explicitly closed the popup and didn't provide a fallback hint, only fallback if popup/unauthorized-domain/operation-not-allowed occurred
     const isEnvPopupRestriction =
       rawMsg.includes('auth/unauthorized-domain') ||
       rawMsg.includes('auth/operation-not-allowed') ||
@@ -390,45 +432,64 @@ export async function connectGmailAccountWithPopup(): Promise<{
   }
 }
 
-export async function signInWithEmail(email: string, password: string): Promise<User> {
+export interface EmailAuthOutcome {
+  user: User | null;
+  account: ActiveAccountSession;
+  snapshot: WorkspaceSnapshot | null;
+  requiresVerification: boolean;
+  verificationEmail?: VerificationEmailDispatchInfo;
+  message?: string;
+}
+
+export async function signInWithEmail(
+  email: string,
+  password: string
+): Promise<EmailAuthOutcome> {
   const cleanEmail = email.trim().toLowerCase();
   let fbUser: User | null = null;
 
+  isPendingVerificationFlow = true;
   try {
-    const result = await signInWithEmailAndPassword(auth, cleanEmail, password);
-    fbUser = result.user;
-  } catch (fbErr) {
-    const raw = fbErr instanceof Error ? fbErr.message : String(fbErr);
-    // If Firebase returned wrong-password or invalid-credential, check if user updated password or registered via server vault
-    if (
-      !raw.includes('auth/operation-not-allowed') &&
-      !raw.includes('auth/user-not-found') &&
-      !raw.includes('auth/invalid-credential') &&
-      !raw.includes('auth/network-request-failed') &&
-      !raw.includes('auth/configuration-not-found')
-    ) {
-      // Let server vault attempt verification; if server vault also fails, it will throw a clear message
+    try {
+      const result = await signInWithEmailAndPassword(auth, cleanEmail, password);
+      fbUser = result.user;
+    } catch {
+      // Allow server account store to validate credentials & verification status
     }
-  }
 
-  const synced = await syncAccountWithServer({
-    action: 'signin',
-    email: cleanEmail,
-    password,
-    uid: fbUser?.uid,
-    fullName: fbUser?.displayName || undefined,
-    firebaseVerified: Boolean(fbUser),
-    isFirebaseUser: Boolean(fbUser),
-  });
+    const synced = await syncAccountWithServer({
+      action: 'signin',
+      email: cleanEmail,
+      password,
+      uid: fbUser?.uid,
+      fullName: fbUser?.displayName || undefined,
+      firebaseVerified: Boolean(fbUser && fbUser.emailVerified),
+      isFirebaseUser: Boolean(fbUser),
+    });
 
-  if (fbUser) {
+    if (synced.requiresVerification) {
+      return {
+        user: null,
+        account: synced.account,
+        snapshot: null,
+        requiresVerification: true,
+        verificationEmail: synced.verificationEmail,
+        message: synced.message,
+      };
+    }
+
+    const resolvedUser = fbUser || createSyntheticFirebaseUser(synced.account);
     notifyAuthSessionChanged(fbUser, synced.account);
-    return fbUser;
+    return {
+      user: resolvedUser,
+      account: synced.account,
+      snapshot: synced.snapshot,
+      requiresVerification: false,
+      message: synced.message,
+    };
+  } finally {
+    isPendingVerificationFlow = false;
   }
-
-  const syntheticUser = createSyntheticFirebaseUser(synced.account);
-  notifyAuthSessionChanged(null, synced.account);
-  return syntheticUser;
 }
 
 export async function signUpWithEmail(
@@ -436,68 +497,178 @@ export async function signUpWithEmail(
   email: string,
   password: string,
   workspaceName?: string
-): Promise<User> {
+): Promise<EmailAuthOutcome> {
   const cleanEmail = email.trim().toLowerCase();
   const cleanName = fullName.trim();
   const cleanWorkspace = (workspaceName || `${cleanName}'s Workspace`).trim();
   let fbUser: User | null = null;
 
+  isPendingVerificationFlow = true;
   try {
-    const result = await createUserWithEmailAndPassword(auth, cleanEmail, password);
-    fbUser = result.user;
-    if (cleanName) {
-      await updateProfile(result.user, { displayName: cleanName });
-    }
     try {
-      await sendEmailVerification(result.user);
-    } catch {
-      // Non-blocking verification email notice
-    }
-  } catch (fbErr) {
-    const raw = fbErr instanceof Error ? fbErr.message : String(fbErr);
-    if (raw.includes('auth/email-already-in-use')) {
-      // Try signing in with the provided password if the account already exists in Firebase
+      const result = await createUserWithEmailAndPassword(auth, cleanEmail, password);
+      fbUser = result.user;
+      if (cleanName) {
+        await updateProfile(result.user, { displayName: cleanName });
+      }
       try {
-        const signInRes = await signInWithEmailAndPassword(auth, cleanEmail, password);
-        fbUser = signInRes.user;
-        if (cleanName && !fbUser.displayName) {
-          await updateProfile(fbUser, { displayName: cleanName });
-        }
+        await sendEmailVerification(result.user);
       } catch {
-        throw new Error(
-          'An account with this email already exists. Please sign in with your password or reset your password.'
-        );
+        // Non-blocking Firebase verification email alongside 6-digit code email
+      }
+    } catch (fbErr) {
+      const raw = fbErr instanceof Error ? fbErr.message : String(fbErr);
+      if (raw.includes('auth/email-already-in-use')) {
+        try {
+          const signInRes = await signInWithEmailAndPassword(auth, cleanEmail, password);
+          fbUser = signInRes.user;
+          if (cleanName && !fbUser.displayName) {
+            await updateProfile(fbUser, { displayName: cleanName });
+          }
+        } catch {
+          // Proceed with server signup/verification code flow
+        }
       }
     }
-    // For auth/operation-not-allowed or configuration errors, proceed seamlessly with persistent server + local account creation!
-  }
 
+    // Request mandatory 6-digit verification code from server & send email to cleanEmail
+    const synced = await syncAccountWithServer({
+      action: 'signup',
+      email: cleanEmail,
+      password,
+      fullName: cleanName,
+      workspaceName: cleanWorkspace,
+      uid: fbUser?.uid,
+      firebaseVerified: false,
+      isFirebaseUser: Boolean(fbUser),
+    });
+
+    return {
+      user: null,
+      account: synced.account,
+      snapshot: null,
+      requiresVerification: true,
+      verificationEmail: synced.verificationEmail,
+      message:
+        synced.message ||
+        `A 6-digit verification code has been sent to ${cleanEmail}. Please enter the code to verify and save your account.`,
+    };
+  } finally {
+    isPendingVerificationFlow = false;
+  }
+}
+
+export async function verifyAccountEmailCode(params: {
+  email: string;
+  code: string;
+  fullName?: string;
+  workspaceName?: string;
+  password?: string;
+}): Promise<{
+  user: User;
+  account: ActiveAccountSession;
+  snapshot: WorkspaceSnapshot | null;
+  message?: string;
+}> {
+  const cleanEmail = params.email.trim().toLowerCase();
   const synced = await syncAccountWithServer({
-    action: 'signup',
+    action: 'verify_code',
     email: cleanEmail,
-    password,
-    fullName: cleanName,
-    workspaceName: cleanWorkspace,
-    uid: fbUser?.uid,
-    firebaseVerified: true,
-    isFirebaseUser: Boolean(fbUser),
+    code: params.code.trim(),
+    fullName: params.fullName,
+    workspaceName: params.workspaceName,
+    password: params.password,
+    uid: auth.currentUser?.uid,
+    isFirebaseUser: Boolean(auth.currentUser),
   });
 
-  if (fbUser) {
-    notifyAuthSessionChanged(fbUser, synced.account);
-    return fbUser;
-  }
+  const activeUser =
+    auth.currentUser && auth.currentUser.email?.toLowerCase() === cleanEmail
+      ? auth.currentUser
+      : createSyntheticFirebaseUser(synced.account);
 
-  const syntheticUser = createSyntheticFirebaseUser(synced.account);
-  notifyAuthSessionChanged(null, synced.account);
-  return syntheticUser;
+  notifyAuthSessionChanged(
+    auth.currentUser && auth.currentUser.email?.toLowerCase() === cleanEmail
+      ? auth.currentUser
+      : null,
+    synced.account
+  );
+
+  return {
+    user: activeUser,
+    account: synced.account,
+    snapshot: synced.snapshot,
+    message: synced.message,
+  };
+}
+
+export async function resendAccountVerificationCode(params: {
+  email: string;
+  fullName?: string;
+  workspaceName?: string;
+}): Promise<{
+  verificationEmail?: VerificationEmailDispatchInfo;
+  message: string;
+}> {
+  const cleanEmail = params.email.trim().toLowerCase();
+  const synced = await syncAccountWithServer({
+    action: 'resend_code',
+    email: cleanEmail,
+    fullName: params.fullName,
+    workspaceName: params.workspaceName,
+    uid: auth.currentUser?.uid,
+  });
+
+  return {
+    verificationEmail: synced.verificationEmail,
+    message:
+      synced.message ||
+      `A new 6-digit verification code has been sent to ${cleanEmail}.`,
+  };
+}
+
+export async function triggerPasswordReset(
+  email: string,
+  newPassword?: string
+): Promise<string> {
+  const cleanEmail = email.trim().toLowerCase();
+  try {
+    await sendPasswordResetEmail(auth, cleanEmail);
+  } catch {
+    // Proceed to server/local password reset
+  }
+  const synced = await syncAccountWithServer({
+    action: 'reset_password',
+    email: cleanEmail,
+    newPassword,
+  });
+  return (
+    synced.message ||
+    `Password reset instructions processed for ${cleanEmail}.`
+  );
+}
+
+export async function triggerEmailVerification(user: User): Promise<void> {
+  try {
+    if (auth.currentUser) {
+      await sendEmailVerification(auth.currentUser);
+    } else if (user && typeof user.reload === 'function') {
+      await sendEmailVerification(user);
+    }
+  } catch {
+    // Non-fatal
+  }
 }
 
 export async function reloadUserSession(): Promise<User | null> {
   if (auth.currentUser) {
-    await auth.currentUser.reload();
-    await auth.currentUser.getIdToken(true);
-    return auth.currentUser;
+    try {
+      await auth.currentUser.reload();
+      notifyAuthSessionChanged(auth.currentUser);
+      return auth.currentUser;
+    } catch {
+      return auth.currentUser;
+    }
   }
   const saved = getStoredActiveAccountSession();
   return saved ? createSyntheticFirebaseUser(saved) : null;
@@ -511,46 +682,7 @@ export async function logOutUser(): Promise<void> {
   try {
     await signOut(auth);
   } catch {
-    // Ignore signout error if not signed into Firebase
+    // Ignore sign-out errors
   }
   notifyAuthSessionChanged(null, null);
-}
-
-export async function triggerPasswordReset(
-  email: string,
-  newPassword?: string
-): Promise<string> {
-  const cleanEmail = email.trim().toLowerCase();
-  let firebaseSent = false;
-  try {
-    await sendPasswordResetEmail(auth, cleanEmail);
-    firebaseSent = true;
-  } catch {
-    // Fallback to server vault password reset
-  }
-
-  const synced = await syncAccountWithServer({
-    action: 'reset_password',
-    email: cleanEmail,
-    newPassword,
-  });
-
-  if (newPassword && newPassword.length >= 6) {
-    return (
-      synced.message ||
-      `Password for ${cleanEmail} has been updated. You can now sign in with your new password.`
-    );
-  }
-
-  return firebaseSent
-    ? `Password reset email sent to ${cleanEmail}. You can also set a new password directly below.`
-    : synced.message || `Password reset ready for ${cleanEmail}.`;
-}
-
-export async function triggerEmailVerification(user: User): Promise<void> {
-  try {
-    await sendEmailVerification(user);
-  } catch {
-    // Ignore if synthetic user
-  }
 }

@@ -240,39 +240,44 @@ export default function App() {
     const unsubscribe = subscribeUnifiedAuthState(async (user, session) => {
       setActiveGatewayAccountUid(user ? user.uid : null);
       if (user) {
-        setIsAuthReady(false);
         const uid = user.uid;
         const email = user.email || session?.email || 'operator@flowpilot.app';
         const displayName =
-          user.displayName ||
           session?.displayName ||
+          user.displayName ||
           email.split('@')[0] ||
           'Workspace Owner';
         const wsName = session?.workspaceName || `${displayName}'s Workspace`;
 
-        // 1. Immediately hydrate from Local or Server Account Snapshot (or starter workspace)
+        // 1. Synchronously hydrate from Local Snapshot or Starter Snapshot first so state is never out-of-sync
         const localSnap = loadLocalWorkspaceSnapshot(uid, email);
         if (localSnap) {
           applyWorkspaceSnapshot(localSnap, uid);
         } else {
-          const serverSnap = await fetchServerWorkspaceSnapshot(uid, email);
-          if (serverSnap) {
-            applyWorkspaceSnapshot(serverSnap, uid);
-            saveLocalWorkspaceSnapshot(uid, email, serverSnap);
-          } else {
-            const starterSnap = buildStarterWorkspaceSnapshot(
-              uid,
-              email,
-              displayName,
-              wsName
-            );
-            applyWorkspaceSnapshot(starterSnap, uid);
-            saveLocalWorkspaceSnapshot(uid, email, starterSnap);
-            void pushServerWorkspaceSnapshot(uid, email, starterSnap);
-          }
+          const starterSnap = buildStarterWorkspaceSnapshot(
+            uid,
+            email,
+            displayName,
+            wsName
+          );
+          applyWorkspaceSnapshot(starterSnap, uid);
+          saveLocalWorkspaceSnapshot(uid, email, starterSnap);
         }
 
-        // 2. If backed by a live Firebase Auth user, also seed/sync Cloud Firestore
+        setCurrentUser(user);
+        setViewMode('workspace');
+        setIsAuthReady(true);
+
+        // 2. Check Server Account Snapshot and sync
+        const serverSnap = await fetchServerWorkspaceSnapshot(uid, email);
+        if (serverSnap && !localSnap) {
+          applyWorkspaceSnapshot(serverSnap, uid);
+          saveLocalWorkspaceSnapshot(uid, email, serverSnap);
+        } else if (localSnap) {
+          void pushServerWorkspaceSnapshot(uid, email, localSnap);
+        }
+
+        // 3. If backed by a live Firebase Auth user, also seed/sync Cloud Firestore
         if (auth.currentUser && auth.currentUser.uid === uid) {
           const wsRef = doc(db, 'workspaces', uid);
           try {
@@ -286,10 +291,6 @@ export default function App() {
             handleFirestoreError(error, OperationType.GET, `workspaces/${uid}`);
           }
         }
-
-        setCurrentUser(user);
-        setViewMode('workspace');
-        setIsAuthReady(true);
       } else {
         setCurrentUser(null);
         const guestSnap = loadLocalWorkspaceSnapshot('guest_sandbox', 'guest@flowpilot.app');
@@ -319,8 +320,10 @@ export default function App() {
   // 1B. Dual-Sync Persistence Effect: Mirror every state mutation to Local & Server Account Storage
   useEffect(() => {
     if (!isAuthReady) return;
-    const uid = currentUser?.uid || 'guest_sandbox';
-    const email = currentUser?.email || privateProfile.email || 'guest@flowpilot.app';
+    const uid = currentUser ? currentUser.uid : 'guest_sandbox';
+    const email = currentUser
+      ? currentUser.email || privateProfile.email || 'operator@flowpilot.app'
+      : 'guest@flowpilot.app';
 
     const snapshot: WorkspaceSnapshot = {
       workspace,
@@ -344,7 +347,7 @@ export default function App() {
     if (currentUser) {
       const timer = setTimeout(() => {
         void pushServerWorkspaceSnapshot(uid, email, snapshot);
-      }, 300);
+      }, 250);
       return () => clearTimeout(timer);
     }
   }, [
@@ -3139,19 +3142,12 @@ export default function App() {
           initialMode={authModalMode}
           onClose={() => setAuthModalOpen(false)}
           onAuthSuccess={(opts) => {
-            if (opts?.workspaceName || opts?.fullName) {
-              setWorkspace((prev) => ({
-                ...prev,
-                name: opts.workspaceName || `${opts.fullName}'s Workspace`,
-                senderName: opts.fullName || prev.senderName,
-              }));
-            }
             if (opts?.email) {
-              setPrivateProfile((prev) => ({
-                ...prev,
-                email: opts.email || prev.email,
-                replyToEmail: opts.email || prev.replyToEmail,
-              }));
+              setAuthBanner(
+                `Verified & Saved: Signed in as ${opts.email}${
+                  opts.workspaceName ? ` (${opts.workspaceName})` : ''
+                }. All workspace data is automatically synced and persisted.`
+              );
             }
             setViewMode('workspace');
           }}
@@ -3865,19 +3861,12 @@ export default function App() {
         initialMode={authModalMode}
         onClose={() => setAuthModalOpen(false)}
         onAuthSuccess={(opts) => {
-          if (opts?.workspaceName || opts?.fullName) {
-            setWorkspace((prev) => ({
-              ...prev,
-              name: opts.workspaceName || `${opts.fullName}'s Workspace`,
-              senderName: opts.fullName || prev.senderName,
-            }));
-          }
           if (opts?.email) {
-            setPrivateProfile((prev) => ({
-              ...prev,
-              email: opts.email || prev.email,
-              replyToEmail: opts.email || prev.replyToEmail,
-            }));
+            setAuthBanner(
+              `Verified & Saved: Signed in as ${opts.email}${
+                opts.workspaceName ? ` (${opts.workspaceName})` : ''
+              }. All workspace data is automatically synced and persisted.`
+            );
           }
           setViewMode('workspace');
         }}

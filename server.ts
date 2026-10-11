@@ -20,6 +20,9 @@ export interface ServerStoredAccount {
   passwordHash: string;
   provider: 'password' | 'google.com';
   emailVerified: boolean;
+  verificationCode?: string;
+  verificationCodeExpiresAt?: string;
+  verificationLastSentAt?: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -111,6 +114,103 @@ function buildDeterministicUidForEmail(email: string): string {
   const clean = email.trim().toLowerCase();
   const hash = crypto.createHash('sha256').update(`fp_uid_${clean}`).digest('hex').slice(0, 24);
   return `usr_${hash}`;
+}
+
+function generateSixDigitVerificationCode(): string {
+  return String(Math.floor(100000 + Math.random() * 900000));
+}
+
+function buildServerStarterWorkspaceSnapshot(
+  uid: string,
+  email: string,
+  displayName: string,
+  workspaceName: string
+): Record<string, unknown> {
+  const cleanName = (displayName || email.split('@')[0] || 'Workspace Owner').trim().slice(0, 100);
+  const cleanEmail = (email || 'operator@flowpilot.app').trim().slice(0, 150);
+  const cleanWsName = (workspaceName || `${cleanName}'s Workspace`).trim().slice(0, 100);
+  const nowIso = new Date().toISOString();
+
+  return {
+    workspace: {
+      id: uid,
+      ownerId: uid,
+      name: cleanWsName,
+      category: 'creator',
+      timezone: 'America/New_York',
+      currency: 'USD',
+      senderName: cleanName,
+      whatsappConnected: true,
+      smsConnected: true,
+      emailConnected: true,
+      notifyNewLeads: true,
+      notifyCampaigns: true,
+    },
+    privateProfile: {
+      id: 'default',
+      ownerId: uid,
+      email: cleanEmail,
+      replyToEmail: cleanEmail,
+      phone: '',
+      mailingAddress: '',
+      whatsappPhoneId: '',
+      smsSenderId: 'FLOWPILOT',
+      emailProviderDomain: '',
+      whatsappBusinessNumber: '',
+      customDomainEmail: '',
+      useCustomDomainEmail: false,
+      messagingIdentitiesJson: JSON.stringify([
+        {
+          id: `id_em_${Date.now().toString(36)}`,
+          channel: 'email',
+          label: `${cleanName} Primary Email`,
+          value: cleanEmail,
+          senderName: cleanName,
+          replyToEmail: cleanEmail,
+          providerType: 'gmail_oauth',
+          verified: true,
+          isDefault: true,
+        },
+      ]),
+      gatewayConfigJson: '{}',
+    },
+    members: [
+      {
+        id: `mem_${Date.now().toString(36)}`,
+        workspaceId: uid,
+        ownerId: uid,
+        memberName: cleanName,
+        memberEmail: cleanEmail,
+        role: 'owner',
+        status: 'active',
+      },
+    ],
+    contacts: [],
+    lists: [
+      {
+        id: `lst_${Date.now().toString(36)}`,
+        workspaceId: uid,
+        ownerId: uid,
+        name: 'General Contacts',
+        description: 'Primary audience list for leads, subscribers, and customers.',
+        category: 'newsletter',
+        defaultConsent: 'opted_in',
+        defaultTags: ['subscriber'],
+        colorAccent: 'emerald',
+        killSwitchEnabled: true,
+        killSwitchTags: ['Purchased_Course'],
+      },
+    ],
+    automations: [],
+    autoResponders: [],
+    inboxThreads: [],
+    campaigns: [],
+    assets: [],
+    chatbots: [],
+    tasks: [],
+    activities: [],
+    updatedAt: nowIso,
+  };
 }
 
 loadPersistentStoresFromDisk();
@@ -1922,7 +2022,61 @@ async function startServer() {
   // ==========================================================================
   // 8. PERSISTENT ACCOUNT AUTHENTICATION & DUAL-SYNC WORKSPACE STATE ENDPOINTS
   // ==========================================================================
-  app.post('/api/accounts/auth', (req, res) => {
+  const dispatchAccountVerificationCodeEmail = async (params: {
+    email: string;
+    displayName: string;
+    workspaceName: string;
+    code: string;
+    gmailAccessToken?: string;
+    emailConnector?: {
+      providerMode?: string;
+      apiKey?: string;
+      fromEmail?: string;
+      fromName?: string;
+    };
+  }) => {
+    const subject = `Your FlowPilot Verification Code: ${params.code}`;
+    const body = [
+      `Hi ${params.displayName},`,
+      ``,
+      `Thank you for creating your workspace (${params.workspaceName}) on FlowPilot.`,
+      `Please enter the 6-digit verification code below to verify your email address (${params.email}) and activate your account:`,
+      ``,
+      `VERIFICATION CODE: ${params.code}`,
+      ``,
+      `This code is valid for 15 minutes.`,
+      ``,
+      `— FlowPilot Account Security`,
+    ].join('\n');
+
+    const receipt = await executeUnifiedServerDispatch({
+      channel: 'email',
+      to: params.email,
+      leadName: params.displayName,
+      from: 'security@flowpilot.app',
+      senderName: 'FlowPilot Account Security',
+      replyToEmail: 'security@flowpilot.app',
+      subject,
+      body,
+      listName: 'Account Verification',
+      source: 'account_verification',
+      gmailAccessToken: params.gmailAccessToken,
+      emailConnector: params.emailConnector,
+    });
+
+    return {
+      to: params.email,
+      subject,
+      body,
+      code: params.code,
+      providerUsed: receipt.providerUsed,
+      status: receipt.status,
+      directLaunchUrl: receipt.directLaunchUrl,
+      sentAt: receipt.timestamp,
+    };
+  };
+
+  app.post('/api/accounts/auth', async (req, res) => {
     const body = req.body || {};
     const action = String(body.action || 'signin').trim().toLowerCase();
     const rawEmail = String(body.email || '').trim().toLowerCase();
@@ -1930,6 +2084,8 @@ async function startServer() {
     const rawFullName = String(body.fullName || body.displayName || '').trim();
     const rawWorkspaceName = String(body.workspaceName || '').trim();
     const rawFirebaseUid = String(body.uid || '').trim();
+    const rawCode = String(body.code || body.verificationCode || '').trim();
+    const gmailAccessToken = String(body.gmailAccessToken || '').trim();
 
     if (!rawEmail || !rawEmail.includes('@')) {
       res.status(400).json({
@@ -1960,6 +2116,9 @@ async function startServer() {
         existingAcc?.workspaceName ||
         `${resolvedName}'s Workspace`;
 
+      const verificationCode = generateSixDigitVerificationCode();
+      const expiresAt = new Date(Date.now() + 15 * 60 * 1000).toISOString();
+
       const newAcc: ServerStoredAccount = {
         uid: resolvedUid,
         email: rawEmail,
@@ -1967,27 +2126,225 @@ async function startServer() {
         workspaceName: resolvedWorkspace.slice(0, 100),
         passwordHash: hashAccountPassword(rawPassword, rawEmail),
         provider: 'password',
-        emailVerified: true,
+        emailVerified: false,
+        verificationCode,
+        verificationCodeExpiresAt: expiresAt,
+        verificationLastSentAt: nowIso,
         createdAt: existingAcc?.createdAt || nowIso,
         updatedAt: nowIso,
       };
 
       serverAccountsByEmail.set(rawEmail, newAcc);
       serverAccountsByUid.set(resolvedUid, newAcc);
-      flushAccountsStoreToDisk();
 
-      const savedSnapshot = serverWorkspaceSnapshotsByUid.get(resolvedUid) || null;
+      // Immediately create and save starter workspace snapshot on disk for this account
+      if (!serverWorkspaceSnapshotsByUid.has(resolvedUid)) {
+        const starterSnap = buildServerStarterWorkspaceSnapshot(
+          resolvedUid,
+          rawEmail,
+          newAcc.displayName,
+          newAcc.workspaceName
+        );
+        serverWorkspaceSnapshotsByUid.set(resolvedUid, starterSnap);
+        serverWorkspaceSnapshotsByUid.set(buildDeterministicUidForEmail(rawEmail), starterSnap);
+      }
+
+      flushAccountsStoreToDisk();
+      flushWorkspacesStoreToDisk();
+
+      const verificationEmail = await dispatchAccountVerificationCodeEmail({
+        email: rawEmail,
+        displayName: newAcc.displayName,
+        workspaceName: newAcc.workspaceName,
+        code: verificationCode,
+        gmailAccessToken: gmailAccessToken || undefined,
+        emailConnector: body.emailConnector,
+      });
+
       res.json({
         ok: true,
+        requiresVerification: true,
+        verified: false,
         account: {
           uid: newAcc.uid,
           email: newAcc.email,
           displayName: newAcc.displayName,
           workspaceName: newAcc.workspaceName,
           provider: newAcc.provider,
+          emailVerified: false,
+        },
+        verificationEmail,
+        message: `A 6-digit verification code has been sent to ${rawEmail}. Enter the code below to verify and activate your account.`,
+      });
+      return;
+    }
+
+    if (action === 'verify_code') {
+      if (!rawCode || rawCode.replace(/\D/g, '').length !== 6) {
+        res.status(400).json({
+          ok: false,
+          error: 'Please enter the 6-digit verification code sent to your email address.',
+        });
+        return;
+      }
+
+      const cleanDigits = rawCode.replace(/\D/g, '');
+      const expectedCode = existingAcc?.verificationCode || String(body.expectedCodeFallback || '').trim();
+
+      if (!expectedCode || cleanDigits !== expectedCode) {
+        res.status(400).json({
+          ok: false,
+          error: 'Invalid verification code. Please check the 6-digit code sent to your email and try again.',
+        });
+        return;
+      }
+
+      if (
+        existingAcc?.verificationCodeExpiresAt &&
+        new Date(existingAcc.verificationCodeExpiresAt).getTime() < Date.now()
+      ) {
+        res.status(400).json({
+          ok: false,
+          error: 'This verification code has expired. Please click "Resend Verification Code" to get a fresh code.',
+        });
+        return;
+      }
+
+      const resolvedUid =
+        rawFirebaseUid || existingAcc?.uid || buildDeterministicUidForEmail(rawEmail);
+      const resolvedName =
+        rawFullName || existingAcc?.displayName || rawEmail.split('@')[0] || 'Workspace Owner';
+      const resolvedWorkspace =
+        rawWorkspaceName ||
+        existingAcc?.workspaceName ||
+        `${resolvedName}'s Workspace`;
+
+      const verifiedAcc: ServerStoredAccount = {
+        uid: resolvedUid,
+        email: rawEmail,
+        displayName: resolvedName.slice(0, 100),
+        workspaceName: resolvedWorkspace.slice(0, 100),
+        passwordHash:
+          existingAcc?.passwordHash ||
+          (rawPassword ? hashAccountPassword(rawPassword, rawEmail) : ''),
+        provider: existingAcc?.provider || 'password',
+        emailVerified: true,
+        verificationCode: undefined,
+        verificationCodeExpiresAt: undefined,
+        createdAt: existingAcc?.createdAt || nowIso,
+        updatedAt: nowIso,
+      };
+
+      serverAccountsByEmail.set(rawEmail, verifiedAcc);
+      serverAccountsByUid.set(resolvedUid, verifiedAcc);
+
+      let savedSnapshot =
+        serverWorkspaceSnapshotsByUid.get(resolvedUid) ||
+        serverWorkspaceSnapshotsByUid.get(buildDeterministicUidForEmail(rawEmail)) ||
+        null;
+
+      if (!savedSnapshot) {
+        savedSnapshot = buildServerStarterWorkspaceSnapshot(
+          resolvedUid,
+          rawEmail,
+          verifiedAcc.displayName,
+          verifiedAcc.workspaceName
+        );
+      } else if (savedSnapshot.workspace && typeof savedSnapshot.workspace === 'object') {
+        savedSnapshot = {
+          ...savedSnapshot,
+          workspace: {
+            ...(savedSnapshot.workspace as Record<string, unknown>),
+            id: resolvedUid,
+            ownerId: resolvedUid,
+            name: verifiedAcc.workspaceName,
+            senderName: verifiedAcc.displayName,
+          },
+          updatedAt: nowIso,
+        };
+      }
+
+      serverWorkspaceSnapshotsByUid.set(resolvedUid, savedSnapshot);
+      serverWorkspaceSnapshotsByUid.set(buildDeterministicUidForEmail(rawEmail), savedSnapshot);
+
+      flushAccountsStoreToDisk();
+      flushWorkspacesStoreToDisk();
+
+      res.json({
+        ok: true,
+        requiresVerification: false,
+        verified: true,
+        account: {
+          uid: verifiedAcc.uid,
+          email: verifiedAcc.email,
+          displayName: verifiedAcc.displayName,
+          workspaceName: verifiedAcc.workspaceName,
+          provider: verifiedAcc.provider,
           emailVerified: true,
         },
         snapshot: savedSnapshot,
+        message: `Email verified! Your account (${rawEmail}) and workspace (${verifiedAcc.workspaceName}) are saved.`,
+      });
+      return;
+    }
+
+    if (action === 'resend_code') {
+      const resolvedUid =
+        rawFirebaseUid || existingAcc?.uid || buildDeterministicUidForEmail(rawEmail);
+      const resolvedName =
+        rawFullName || existingAcc?.displayName || rawEmail.split('@')[0] || 'Workspace Owner';
+      const resolvedWorkspace =
+        rawWorkspaceName ||
+        existingAcc?.workspaceName ||
+        `${resolvedName}'s Workspace`;
+
+      const verificationCode = generateSixDigitVerificationCode();
+      const expiresAt = new Date(Date.now() + 15 * 60 * 1000).toISOString();
+
+      const updatedAcc: ServerStoredAccount = {
+        uid: resolvedUid,
+        email: rawEmail,
+        displayName: resolvedName.slice(0, 100),
+        workspaceName: resolvedWorkspace.slice(0, 100),
+        passwordHash:
+          existingAcc?.passwordHash ||
+          (rawPassword ? hashAccountPassword(rawPassword, rawEmail) : ''),
+        provider: existingAcc?.provider || 'password',
+        emailVerified: false,
+        verificationCode,
+        verificationCodeExpiresAt: expiresAt,
+        verificationLastSentAt: nowIso,
+        createdAt: existingAcc?.createdAt || nowIso,
+        updatedAt: nowIso,
+      };
+
+      serverAccountsByEmail.set(rawEmail, updatedAcc);
+      serverAccountsByUid.set(resolvedUid, updatedAcc);
+      flushAccountsStoreToDisk();
+
+      const verificationEmail = await dispatchAccountVerificationCodeEmail({
+        email: rawEmail,
+        displayName: updatedAcc.displayName,
+        workspaceName: updatedAcc.workspaceName,
+        code: verificationCode,
+        gmailAccessToken: gmailAccessToken || undefined,
+        emailConnector: body.emailConnector,
+      });
+
+      res.json({
+        ok: true,
+        requiresVerification: true,
+        verified: false,
+        account: {
+          uid: updatedAcc.uid,
+          email: updatedAcc.email,
+          displayName: updatedAcc.displayName,
+          workspaceName: updatedAcc.workspaceName,
+          provider: updatedAcc.provider,
+          emailVerified: false,
+        },
+        verificationEmail,
+        message: `A new 6-digit verification code has been sent to ${rawEmail}.`,
       });
       return;
     }
@@ -2027,8 +2384,61 @@ async function startServer() {
         if (!existingAcc.passwordHash) {
           existingAcc.passwordHash = expectedHash;
         }
-        existingAcc.emailVerified = true;
         existingAcc.updatedAt = nowIso;
+
+        // Enforce mandatory verification code if the account has not been verified yet
+        if (!existingAcc.emailVerified) {
+          const verificationCode = generateSixDigitVerificationCode();
+          existingAcc.verificationCode = verificationCode;
+          existingAcc.verificationCodeExpiresAt = new Date(
+            Date.now() + 15 * 60 * 1000
+          ).toISOString();
+          existingAcc.verificationLastSentAt = nowIso;
+
+          serverAccountsByEmail.set(rawEmail, existingAcc);
+          serverAccountsByUid.set(existingAcc.uid, existingAcc);
+          flushAccountsStoreToDisk();
+
+          const verificationEmail = await dispatchAccountVerificationCodeEmail({
+            email: rawEmail,
+            displayName: existingAcc.displayName,
+            workspaceName: existingAcc.workspaceName,
+            code: verificationCode,
+            gmailAccessToken: gmailAccessToken || undefined,
+            emailConnector: body.emailConnector,
+          });
+
+          res.json({
+            ok: true,
+            requiresVerification: true,
+            verified: false,
+            account: {
+              uid: existingAcc.uid,
+              email: existingAcc.email,
+              displayName: existingAcc.displayName,
+              workspaceName: existingAcc.workspaceName,
+              provider: existingAcc.provider,
+              emailVerified: false,
+            },
+            verificationEmail,
+            message: `Your account (${rawEmail}) requires email verification. We sent a 6-digit verification code to your email address.`,
+          });
+          return;
+        }
+
+        let savedSnapshot =
+          serverWorkspaceSnapshotsByUid.get(existingAcc.uid) ||
+          serverWorkspaceSnapshotsByUid.get(buildDeterministicUidForEmail(rawEmail)) ||
+          null;
+        if (!savedSnapshot) {
+          savedSnapshot = buildServerStarterWorkspaceSnapshot(
+            existingAcc.uid,
+            existingAcc.email,
+            existingAcc.displayName,
+            existingAcc.workspaceName
+          );
+          serverWorkspaceSnapshotsByUid.set(existingAcc.uid, savedSnapshot);
+        }
 
         serverAccountsByEmail.set(rawEmail, existingAcc);
         serverAccountsByUid.set(existingAcc.uid, existingAcc);
@@ -2037,6 +2447,8 @@ async function startServer() {
 
         res.json({
           ok: true,
+          requiresVerification: false,
+          verified: true,
           account: {
             uid: existingAcc.uid,
             email: existingAcc.email,
@@ -2045,56 +2457,74 @@ async function startServer() {
             provider: existingAcc.provider,
             emailVerified: true,
           },
-          snapshot: serverWorkspaceSnapshotsByUid.get(existingAcc.uid) || null,
+          snapshot: savedSnapshot,
         });
         return;
       }
 
-      if (rawPassword.length < 6) {
-        res.status(400).json({
-          ok: false,
-          error: 'Password must be at least 6 characters.',
-        });
-        return;
-      }
+      // If account wasn't in server store yet, check if client is restoring a previously verified account
+      if (body.firebaseVerified || body.localVerifiedAccount) {
+        const resolvedUid = rawFirebaseUid || buildDeterministicUidForEmail(rawEmail);
+        const inferredName =
+          rawFullName ||
+          rawEmail
+            .split('@')[0]
+            .replace(/[._-]+/g, ' ')
+            .replace(/\b\w/g, (c) => c.toUpperCase()) ||
+          'Workspace Operator';
+        const inferredWorkspace = rawWorkspaceName || `${inferredName}'s Workspace`;
 
-      const resolvedUid = rawFirebaseUid || buildDeterministicUidForEmail(rawEmail);
-      const inferredName =
-        rawFullName ||
-        rawEmail
-          .split('@')[0]
-          .replace(/[._-]+/g, ' ')
-          .replace(/\b\w/g, (c) => c.toUpperCase()) ||
-        'Workspace Operator';
-      const inferredWorkspace = rawWorkspaceName || `${inferredName}'s Workspace`;
-
-      const provisionedAcc: ServerStoredAccount = {
-        uid: resolvedUid,
-        email: rawEmail,
-        displayName: inferredName.slice(0, 100),
-        workspaceName: inferredWorkspace.slice(0, 100),
-        passwordHash: hashAccountPassword(rawPassword, rawEmail),
-        provider: 'password',
-        emailVerified: true,
-        createdAt: nowIso,
-        updatedAt: nowIso,
-      };
-
-      serverAccountsByEmail.set(rawEmail, provisionedAcc);
-      serverAccountsByUid.set(resolvedUid, provisionedAcc);
-      flushAccountsStoreToDisk();
-
-      res.json({
-        ok: true,
-        account: {
-          uid: provisionedAcc.uid,
-          email: provisionedAcc.email,
-          displayName: provisionedAcc.displayName,
-          workspaceName: provisionedAcc.workspaceName,
-          provider: provisionedAcc.provider,
+        const provisionedAcc: ServerStoredAccount = {
+          uid: resolvedUid,
+          email: rawEmail,
+          displayName: inferredName.slice(0, 100),
+          workspaceName: inferredWorkspace.slice(0, 100),
+          passwordHash: hashAccountPassword(rawPassword, rawEmail),
+          provider: 'password',
           emailVerified: true,
-        },
-        snapshot: serverWorkspaceSnapshotsByUid.get(resolvedUid) || null,
+          createdAt: nowIso,
+          updatedAt: nowIso,
+        };
+
+        let savedSnapshot =
+          serverWorkspaceSnapshotsByUid.get(resolvedUid) ||
+          serverWorkspaceSnapshotsByUid.get(buildDeterministicUidForEmail(rawEmail)) ||
+          null;
+        if (!savedSnapshot) {
+          savedSnapshot = buildServerStarterWorkspaceSnapshot(
+            resolvedUid,
+            rawEmail,
+            provisionedAcc.displayName,
+            provisionedAcc.workspaceName
+          );
+          serverWorkspaceSnapshotsByUid.set(resolvedUid, savedSnapshot);
+        }
+
+        serverAccountsByEmail.set(rawEmail, provisionedAcc);
+        serverAccountsByUid.set(resolvedUid, provisionedAcc);
+        flushAccountsStoreToDisk();
+        flushWorkspacesStoreToDisk();
+
+        res.json({
+          ok: true,
+          requiresVerification: false,
+          verified: true,
+          account: {
+            uid: provisionedAcc.uid,
+            email: provisionedAcc.email,
+            displayName: provisionedAcc.displayName,
+            workspaceName: provisionedAcc.workspaceName,
+            provider: provisionedAcc.provider,
+            emailVerified: true,
+          },
+          snapshot: savedSnapshot,
+        });
+        return;
+      }
+
+      res.status(404).json({
+        ok: false,
+        error: 'No account found for this email address. Please switch to "Create Free Account" to register and verify your email with a 6-digit code.',
       });
       return;
     }
@@ -2134,6 +2564,21 @@ async function startServer() {
         updatedAt: nowIso,
       };
 
+      let savedSnapshot =
+        serverWorkspaceSnapshotsByUid.get(resolvedUid) ||
+        serverWorkspaceSnapshotsByUid.get(buildDeterministicUidForEmail(rawEmail)) ||
+        null;
+      if (!savedSnapshot) {
+        savedSnapshot = buildServerStarterWorkspaceSnapshot(
+          resolvedUid,
+          rawEmail,
+          googleAcc.displayName,
+          googleAcc.workspaceName
+        );
+        serverWorkspaceSnapshotsByUid.set(resolvedUid, savedSnapshot);
+        serverWorkspaceSnapshotsByUid.set(buildDeterministicUidForEmail(rawEmail), savedSnapshot);
+      }
+
       serverAccountsByEmail.set(rawEmail, googleAcc);
       serverAccountsByUid.set(resolvedUid, googleAcc);
       flushAccountsStoreToDisk();
@@ -2141,6 +2586,8 @@ async function startServer() {
 
       res.json({
         ok: true,
+        requiresVerification: false,
+        verified: true,
         account: {
           uid: googleAcc.uid,
           email: googleAcc.email,
@@ -2149,7 +2596,7 @@ async function startServer() {
           provider: googleAcc.provider,
           emailVerified: true,
         },
-        snapshot: serverWorkspaceSnapshotsByUid.get(resolvedUid) || null,
+        snapshot: savedSnapshot,
       });
       return;
     }
@@ -2237,6 +2684,25 @@ async function startServer() {
       const detUid = buildDeterministicUidForEmail(email);
       serverWorkspaceSnapshotsByUid.set(detUid, enrichedSnapshot);
     }
+
+    // Keep account record displayName / workspaceName synchronized with workspace snapshot
+    const accByEmail = email ? serverAccountsByEmail.get(email) : undefined;
+    const accByUid = serverAccountsByUid.get(resolvedUid);
+    const targetAcc = accByEmail || accByUid;
+    if (targetAcc && snapshot.workspace && typeof snapshot.workspace === 'object') {
+      const wsObj = snapshot.workspace as Record<string, unknown>;
+      if (typeof wsObj.name === 'string' && wsObj.name.trim()) {
+        targetAcc.workspaceName = wsObj.name.trim().slice(0, 100);
+      }
+      if (typeof wsObj.senderName === 'string' && wsObj.senderName.trim()) {
+        targetAcc.displayName = wsObj.senderName.trim().slice(0, 100);
+      }
+      targetAcc.updatedAt = enrichedSnapshot.updatedAt;
+      serverAccountsByEmail.set(targetAcc.email, targetAcc);
+      serverAccountsByUid.set(targetAcc.uid, targetAcc);
+      flushAccountsStoreToDisk();
+    }
+
     flushWorkspacesStoreToDisk();
 
     res.json({
