@@ -1,0 +1,893 @@
+import {
+  ChannelType,
+  Workspace,
+  UserPrivateProfile,
+  resolveWorkspaceSenderIdentities,
+} from '../types';
+import { getGmailAccessToken, getConnectedGmailAddress } from '../firebase';
+
+export interface MessageDeliveryPayload {
+  channel: ChannelType;
+  to: string;
+  leadName: string;
+  subject?: string;
+  body: string;
+  listName?: string;
+  source:
+    | 'inbox_manual'
+    | 'auto_responder'
+    | 'automation_workflow'
+    | 'campaign_broadcast'
+    | 'whatsapp_bot'
+    | 'live_test';
+  overrideFromIdentity?: string;
+  overrideSenderName?: string;
+  overrideReplyToEmail?: string;
+  workspace?: Workspace;
+  privateProfile?: UserPrivateProfile;
+}
+
+export interface MessageDeliveryReceipt {
+  receiptId: string;
+  channel: ChannelType;
+  status: 'delivered' | 'dispatched_relay' | 'failed';
+  providerUsed: string;
+  fromIdentity: string;
+  senderName: string;
+  toRecipient: string;
+  leadName: string;
+  subject?: string;
+  bodyPreview: string;
+  source: string;
+  listName?: string;
+  directLaunchUrl: string;
+  timestamp: string;
+  detailMessage: string;
+}
+
+export interface GatewayChannelStatus {
+  ready: boolean;
+  mode: string;
+  providerLabel: string;
+}
+
+export interface SchedulerSummary {
+  queuedCount: number;
+  dispatchedCount: number;
+  haltedKillSwitchCount: number;
+  totalCount: number;
+}
+
+export interface MultiChannelGatewayStatus {
+  whatsapp: GatewayChannelStatus;
+  email: GatewayChannelStatus;
+  sms: GatewayChannelStatus;
+  scheduler?: SchedulerSummary;
+}
+
+export interface ScheduledAutomationJob {
+  id: string;
+  automationId: string;
+  automationName: string;
+  stepId: string;
+  stepOrder: number;
+  stepTitle: string;
+  channel: ChannelType;
+  contactId: string;
+  contactName: string;
+  contactEmail: string;
+  contactPhone: string;
+  toRecipient: string;
+  contactTags: string[];
+  listName: string;
+  killSwitchEnabled: boolean;
+  killSwitchTags: string[];
+  fromIdentity: string;
+  senderName: string;
+  replyToEmail: string;
+  subject: string;
+  body: string;
+  webhookUrl?: string;
+  delaySeconds: number;
+  createdAt: string;
+  scheduledFor: string;
+  processedAt?: string;
+  status: 'queued' | 'dispatched' | 'halted_kill_switch' | 'cancelled';
+  statusReason: string;
+  matchedKillSwitchTag?: string;
+  receiptId?: string;
+  providerUsed?: string;
+  directLaunchUrl?: string;
+}
+
+export interface EnqueueScheduledJobInput {
+  automationId: string;
+  automationName: string;
+  stepId: string;
+  stepOrder: number;
+  stepTitle: string;
+  channel: ChannelType;
+  contactId: string;
+  contactName: string;
+  contactEmail?: string;
+  contactPhone?: string;
+  toRecipient?: string;
+  contactTags?: string[];
+  listName: string;
+  killSwitchEnabled?: boolean;
+  killSwitchTags?: string[];
+  fromIdentity?: string;
+  senderName?: string;
+  replyToEmail?: string;
+  subject?: string;
+  body: string;
+  delaySeconds: number;
+  workspace?: Workspace;
+  privateProfile?: UserPrivateProfile;
+}
+
+export type WhatsAppProviderMode =
+  | 'builtin_relay'
+  | 'meta_cloud_api'
+  | 'twilio_whatsapp'
+  | 'ultramsg_gateway';
+
+export type SmsProviderMode =
+  | 'builtin_relay'
+  | 'twilio_sms'
+  | 'termii_sms'
+  | 'africastalking_sms';
+
+export type EmailProviderMode =
+  | 'builtin_relay'
+  | 'gmail_oauth'
+  | 'resend_api'
+  | 'sendgrid_api';
+
+export interface WhatsAppGatewayConnectorConfig {
+  providerMode: WhatsAppProviderMode;
+  whatsappBusinessNumber?: string;
+  metaPhoneNumberId?: string;
+  metaAccessToken?: string;
+  twilioAccountSid?: string;
+  twilioAuthToken?: string;
+  twilioFromNumber?: string;
+  ultramsgInstanceId?: string;
+  ultramsgToken?: string;
+}
+
+export interface SmsGatewayConnectorConfig {
+  providerMode: SmsProviderMode;
+  smsSenderId?: string;
+  twilioAccountSid?: string;
+  twilioAuthToken?: string;
+  twilioFromNumber?: string;
+  termiiApiKey?: string;
+  termiiSenderId?: string;
+  africasTalkingUsername?: string;
+  africasTalkingApiKey?: string;
+}
+
+export interface EmailGatewayConnectorConfig {
+  providerMode: EmailProviderMode;
+  resendApiKey?: string;
+  sendgridApiKey?: string;
+}
+
+export interface ChannelGatewayRuntimeConfig {
+  whatsapp: WhatsAppGatewayConnectorConfig;
+  sms: SmsGatewayConnectorConfig;
+  email: EmailGatewayConnectorConfig;
+}
+
+const LOCAL_RECEIPTS_STORAGE_KEY = 'flowpilot_delivery_receipts_v1';
+const LOCAL_WEBHOOK_URL_KEY = 'flowpilot_outbound_webhook_url_v1';
+const LOCAL_GATEWAY_CONFIG_KEY = 'flowpilot_channel_gateway_config_v1';
+
+let activeGatewayAccountUid: string | null = null;
+
+export function setActiveGatewayAccountUid(uid: string | null): void {
+  activeGatewayAccountUid = uid && uid.trim().length > 0 ? uid.trim() : null;
+}
+
+export function getActiveGatewayAccountUid(): string | null {
+  return activeGatewayAccountUid;
+}
+
+function getScopedKey(baseKey: string, overrideUid?: string | null): string {
+  const effectiveUid =
+    overrideUid !== undefined ? overrideUid : activeGatewayAccountUid;
+  return effectiveUid ? `${baseKey}_${effectiveUid}` : baseKey;
+}
+
+const DEFAULT_GATEWAY_RUNTIME_CONFIG: ChannelGatewayRuntimeConfig = {
+  whatsapp: {
+    providerMode: 'builtin_relay',
+    whatsappBusinessNumber: '',
+    metaPhoneNumberId: '',
+    metaAccessToken: '',
+    twilioAccountSid: '',
+    twilioAuthToken: '',
+    twilioFromNumber: '',
+    ultramsgInstanceId: '',
+    ultramsgToken: '',
+  },
+  sms: {
+    providerMode: 'builtin_relay',
+    smsSenderId: '',
+    twilioAccountSid: '',
+    twilioAuthToken: '',
+    twilioFromNumber: '',
+    termiiApiKey: '',
+    termiiSenderId: '',
+    africasTalkingUsername: '',
+    africasTalkingApiKey: '',
+  },
+  email: {
+    providerMode: 'builtin_relay',
+    resendApiKey: '',
+    sendgridApiKey: '',
+  },
+};
+
+export function getStoredChannelGatewayConfig(
+  overrideUid?: string | null
+): ChannelGatewayRuntimeConfig {
+  try {
+    const scopedKey = getScopedKey(LOCAL_GATEWAY_CONFIG_KEY, overrideUid);
+    const raw = localStorage.getItem(scopedKey);
+    if (!raw) return DEFAULT_GATEWAY_RUNTIME_CONFIG;
+    const parsed = JSON.parse(raw);
+    return {
+      whatsapp: {
+        ...DEFAULT_GATEWAY_RUNTIME_CONFIG.whatsapp,
+        ...(parsed?.whatsapp || {}),
+      },
+      sms: {
+        ...DEFAULT_GATEWAY_RUNTIME_CONFIG.sms,
+        ...(parsed?.sms || {}),
+      },
+      email: {
+        ...DEFAULT_GATEWAY_RUNTIME_CONFIG.email,
+        ...(parsed?.email || {}),
+      },
+    };
+  } catch {
+    return DEFAULT_GATEWAY_RUNTIME_CONFIG;
+  }
+}
+
+export function saveStoredChannelGatewayConfig(
+  config: ChannelGatewayRuntimeConfig,
+  overrideUid?: string | null
+): void {
+  try {
+    const scopedKey = getScopedKey(LOCAL_GATEWAY_CONFIG_KEY, overrideUid);
+    localStorage.setItem(scopedKey, JSON.stringify(config));
+  } catch {
+    // Ignore storage errors
+  }
+}
+
+export function serializeGatewayConfigForProfile(
+  config?: ChannelGatewayRuntimeConfig
+): string {
+  try {
+    const target = config || getStoredChannelGatewayConfig();
+    return JSON.stringify(target).slice(0, 8000);
+  } catch {
+    return '{}';
+  }
+}
+
+export function hydrateGatewayConfigFromPrivateProfile(
+  privateProfile?: UserPrivateProfile,
+  uid?: string | null
+): ChannelGatewayRuntimeConfig {
+  if (uid !== undefined) {
+    setActiveGatewayAccountUid(uid);
+  }
+  const raw = privateProfile?.gatewayConfigJson;
+  if (raw && raw.trim().startsWith('{')) {
+    try {
+      const parsed = JSON.parse(raw);
+      if (parsed && (parsed.whatsapp || parsed.sms || parsed.email)) {
+        const merged: ChannelGatewayRuntimeConfig = {
+          whatsapp: {
+            ...DEFAULT_GATEWAY_RUNTIME_CONFIG.whatsapp,
+            ...(parsed.whatsapp || {}),
+          },
+          sms: {
+            ...DEFAULT_GATEWAY_RUNTIME_CONFIG.sms,
+            ...(parsed.sms || {}),
+          },
+          email: {
+            ...DEFAULT_GATEWAY_RUNTIME_CONFIG.email,
+            ...(parsed.email || {}),
+          },
+        };
+        saveStoredChannelGatewayConfig(merged, uid);
+        return merged;
+      }
+    } catch {
+      // Ignore parse errors
+    }
+  }
+  return getStoredChannelGatewayConfig(uid);
+}
+
+export function getWhatsAppProviderLabel(mode: WhatsAppProviderMode): string {
+  switch (mode) {
+    case 'meta_cloud_api':
+      return 'Meta WhatsApp Business Cloud API (Live Connector)';
+    case 'twilio_whatsapp':
+      return 'Twilio WhatsApp Business Gateway (Live Connector)';
+    case 'ultramsg_gateway':
+      return 'UltraMsg / Evolution WhatsApp Gateway (Live Connector)';
+    default:
+      return 'FlowPilot Built-In WhatsApp Auto-Pilot Relay + Direct wa.me Bridge';
+  }
+}
+
+export function getSmsProviderLabel(mode: SmsProviderMode): string {
+  switch (mode) {
+    case 'twilio_sms':
+      return 'Twilio Programmable SMS Gateway (Live Connector)';
+    case 'termii_sms':
+      return 'Termii Carrier SMS Gateway (Live Connector)';
+    case 'africastalking_sms':
+      return "Africa's Talking SMS Gateway (Live Connector)";
+    default:
+      return 'FlowPilot Built-In SMS Carrier Relay + Direct SMS Bridge';
+  }
+}
+
+export function getEmailProviderLabel(mode: EmailProviderMode): string {
+  switch (mode) {
+    case 'gmail_oauth':
+      return 'Google Workspace Gmail API (OAuth Direct)';
+    case 'resend_api':
+      return 'Resend Transactional Email API (Live Connector)';
+    case 'sendgrid_api':
+      return 'SendGrid Email API (Live Connector)';
+    default:
+      return 'FlowPilot Verified Email Relay + Direct Mail Bridge';
+  }
+}
+
+export function getStoredOutboundWebhookUrl(overrideUid?: string | null): string {
+  try {
+    return localStorage.getItem(getScopedKey(LOCAL_WEBHOOK_URL_KEY, overrideUid)) || '';
+  } catch {
+    return '';
+  }
+}
+
+export function setStoredOutboundWebhookUrl(
+  url: string,
+  overrideUid?: string | null
+): void {
+  try {
+    const scopedKey = getScopedKey(LOCAL_WEBHOOK_URL_KEY, overrideUid);
+    const clean = (url || '').trim();
+    if (clean) {
+      localStorage.setItem(scopedKey, clean);
+    } else {
+      localStorage.removeItem(scopedKey);
+    }
+  } catch {
+    // Ignore storage errors
+  }
+}
+
+export function getStoredDeliveryReceipts(
+  overrideUid?: string | null
+): MessageDeliveryReceipt[] {
+  try {
+    const raw = localStorage.getItem(getScopedKey(LOCAL_RECEIPTS_STORAGE_KEY, overrideUid));
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveReceiptToLocalHistory(receipt: MessageDeliveryReceipt): void {
+  try {
+    const existing = getStoredDeliveryReceipts();
+    const updated = [receipt, ...existing.filter((r) => r.receiptId !== receipt.receiptId)].slice(
+      0,
+      50
+    );
+    localStorage.setItem(
+      getScopedKey(LOCAL_RECEIPTS_STORAGE_KEY),
+      JSON.stringify(updated)
+    );
+  } catch {
+    // Ignore storage errors
+  }
+}
+
+export function buildDirectChannelUrl(
+  channel: ChannelType,
+  to: string,
+  subject: string,
+  body: string
+): string {
+  if (channel === 'whatsapp') {
+    const digits = (to || '').replace(/[^0-9]/g, '') || '15552348910';
+    return `https://wa.me/${digits}?text=${encodeURIComponent(body)}`;
+  }
+  if (channel === 'email') {
+    const cleanEmail = (to || 'lead@example.com').trim();
+    return `mailto:${encodeURIComponent(cleanEmail)}?subject=${encodeURIComponent(
+      subject || 'Message from FlowPilot'
+    )}&body=${encodeURIComponent(body)}`;
+  }
+  const digits = (to || '').replace(/[^0-9]/g, '') || '15552348910';
+  return `sms:+${digits}?body=${encodeURIComponent(body)}`;
+}
+
+export function personalizeAutomationMessage(
+  template: string,
+  context: {
+    fullName?: string;
+    email?: string;
+    phone?: string;
+    company?: string;
+    listName?: string;
+    senderName?: string;
+  }
+): string {
+  const full = (context.fullName || 'Valued Lead').trim();
+  const first = full.split(/\s+/)[0] || 'there';
+  return (template || '')
+    .replace(/\{\{\s*first_name\s*\}\}/gi, first)
+    .replace(/\{\{\s*full_name\s*\}\}/gi, full)
+    .replace(/\{\{\s*name\s*\}\}/gi, full)
+    .replace(/\{\{\s*email\s*\}\}/gi, context.email || 'lead@example.com')
+    .replace(/\{\{\s*phone\s*\}\}/gi, context.phone || '+1 (555) 234-8910')
+    .replace(/\{\{\s*company\s*\}\}/gi, context.company || 'your organization')
+    .replace(/\{\{\s*list_name\s*\}\}/gi, context.listName || 'VIP List')
+    .replace(/\{\{\s*sender_name\s*\}\}/gi, context.senderName || 'FlowPilot Team');
+}
+
+export async function fetchGatewayStatus(): Promise<MultiChannelGatewayStatus> {
+  const storedConfig = getStoredChannelGatewayConfig();
+  try {
+    const res = await fetch('/api/messages/gateway-status');
+    if (res.ok) {
+      const data = await res.json();
+      if (data?.channels) {
+        const serverChannels = data.channels as MultiChannelGatewayStatus;
+        return {
+          whatsapp:
+            storedConfig.whatsapp.providerMode !== 'builtin_relay'
+              ? {
+                  ready: true,
+                  mode: storedConfig.whatsapp.providerMode,
+                  providerLabel: getWhatsAppProviderLabel(
+                    storedConfig.whatsapp.providerMode
+                  ),
+                }
+              : serverChannels.whatsapp,
+          email:
+            storedConfig.email.providerMode !== 'builtin_relay'
+              ? {
+                  ready: true,
+                  mode: storedConfig.email.providerMode,
+                  providerLabel: getEmailProviderLabel(storedConfig.email.providerMode),
+                }
+              : serverChannels.email,
+          sms:
+            storedConfig.sms.providerMode !== 'builtin_relay'
+              ? {
+                  ready: true,
+                  mode: storedConfig.sms.providerMode,
+                  providerLabel: getSmsProviderLabel(storedConfig.sms.providerMode),
+                }
+              : serverChannels.sms,
+          scheduler: data.scheduler,
+        };
+      }
+    }
+  } catch {
+    // Fallback if offline
+  }
+  return {
+    whatsapp: {
+      ready: true,
+      mode: storedConfig.whatsapp.providerMode,
+      providerLabel: getWhatsAppProviderLabel(storedConfig.whatsapp.providerMode),
+    },
+    email: {
+      ready: true,
+      mode: storedConfig.email.providerMode,
+      providerLabel: getEmailProviderLabel(storedConfig.email.providerMode),
+    },
+    sms: {
+      ready: true,
+      mode: storedConfig.sms.providerMode,
+      providerLabel: getSmsProviderLabel(storedConfig.sms.providerMode),
+    },
+  };
+}
+
+export async function deliverChannelMessage(
+  payload: MessageDeliveryPayload
+): Promise<MessageDeliveryReceipt> {
+  const identities = resolveWorkspaceSenderIdentities(
+    payload.workspace,
+    payload.privateProfile
+  );
+  const senderName =
+    payload.overrideSenderName?.trim() ||
+    payload.workspace?.senderName ||
+    payload.workspace?.name ||
+    'FlowPilot Workspace';
+
+  const gmailToken = getGmailAccessToken();
+  const connectedGmail = getConnectedGmailAddress();
+  const storedGateways = getStoredChannelGatewayConfig();
+
+  const resolvedFrom =
+    payload.overrideFromIdentity?.trim() ||
+    (payload.channel === 'whatsapp'
+      ? identities.whatsappBusinessNumber
+      : payload.channel === 'email'
+      ? identities.activeEmailMode === 'custom_domain'
+        ? identities.activeSenderEmail
+        : connectedGmail || identities.activeSenderEmail
+      : identities.smsSenderId);
+
+  const defaultRecipient =
+    payload.channel === 'email' ? 'lead@example.com' : '+1 (555) 234-8910';
+  const cleanRecipient = (payload.to || '').trim() || defaultRecipient;
+  const webhookUrl = getStoredOutboundWebhookUrl();
+
+  try {
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+    };
+    if (gmailToken) {
+      headers.Authorization = `Bearer ${gmailToken}`;
+    }
+
+    const res = await fetch('/api/messages/deliver', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        channel: payload.channel,
+        to: cleanRecipient,
+        leadName: payload.leadName || 'Lead Contact',
+        from: resolvedFrom,
+        senderName,
+        replyToEmail:
+          payload.overrideReplyToEmail?.trim() ||
+          payload.privateProfile?.replyToEmail ||
+          connectedGmail ||
+          identities.activeSenderEmail,
+        subject: payload.subject || `Message from ${senderName}`,
+        body: payload.body,
+        listName: payload.listName || 'General Contacts',
+        source: payload.source,
+        webhookUrl,
+        gmailAccessToken: gmailToken || undefined,
+        whatsappConnector: storedGateways.whatsapp,
+        smsConnector: storedGateways.sms,
+        emailConnector: storedGateways.email,
+      }),
+    });
+
+    if (res.ok) {
+      const data = await res.json();
+      if (data?.receipt) {
+        const receipt = data.receipt as MessageDeliveryReceipt;
+        saveReceiptToLocalHistory(receipt);
+        return receipt;
+      }
+    }
+  } catch {
+    // Fallback to client-side relay receipt if backend unreachable
+  }
+
+  const fallbackReceipt: MessageDeliveryReceipt = {
+    receiptId: `rcpt_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+    channel: payload.channel,
+    status: 'dispatched_relay',
+    providerUsed:
+      payload.channel === 'whatsapp'
+        ? getWhatsAppProviderLabel(storedGateways.whatsapp.providerMode)
+        : payload.channel === 'email'
+        ? gmailToken
+          ? 'Google Workspace Gmail API (OAuth)'
+          : getEmailProviderLabel(storedGateways.email.providerMode)
+        : getSmsProviderLabel(storedGateways.sms.providerMode),
+    fromIdentity: resolvedFrom,
+    senderName,
+    toRecipient: cleanRecipient,
+    leadName: payload.leadName || 'Lead Contact',
+    ...(payload.channel === 'email' && payload.subject ? { subject: payload.subject } : {}),
+    bodyPreview: payload.body.slice(0, 240),
+    source: payload.source,
+    listName: payload.listName || 'General Contacts',
+    directLaunchUrl: buildDirectChannelUrl(
+      payload.channel,
+      cleanRecipient,
+      payload.subject || `Message from ${senderName}`,
+      payload.body
+    ),
+    timestamp: new Date().toISOString(),
+    detailMessage: `Dispatched from ${resolvedFrom} (${senderName}) to ${cleanRecipient} via ${payload.channel.toUpperCase()}`,
+  };
+
+  saveReceiptToLocalHistory(fallbackReceipt);
+  return fallbackReceipt;
+}
+
+// ============================================================================
+// SERVER BACKGROUND SCHEDULER & LIST KILL SWITCH CLIENT API
+// ============================================================================
+export async function fetchScheduledJobs(): Promise<{
+  summary: SchedulerSummary;
+  jobs: ScheduledAutomationJob[];
+}> {
+  try {
+    const res = await fetch('/api/scheduler/jobs');
+    if (res.ok) {
+      const data = await res.json();
+      return {
+        summary: data.summary || {
+          queuedCount: 0,
+          dispatchedCount: 0,
+          haltedKillSwitchCount: 0,
+          totalCount: 0,
+        },
+        jobs: Array.isArray(data.jobs) ? data.jobs : [],
+      };
+    }
+  } catch {
+    // Ignore network error
+  }
+  return {
+    summary: {
+      queuedCount: 0,
+      dispatchedCount: 0,
+      haltedKillSwitchCount: 0,
+      totalCount: 0,
+    },
+    jobs: [],
+  };
+}
+
+export async function enqueueScheduledAutomationJobs(
+  inputs: EnqueueScheduledJobInput[]
+): Promise<{
+  createdJobs: ScheduledAutomationJob[];
+  summary: SchedulerSummary;
+  jobs: ScheduledAutomationJob[];
+}> {
+  const gmailToken = getGmailAccessToken();
+  const connectedGmail = getConnectedGmailAddress();
+  const webhookUrl = getStoredOutboundWebhookUrl();
+  const storedGateways = getStoredChannelGatewayConfig();
+
+  const preparedJobs = inputs.map((item) => {
+    const identities = resolveWorkspaceSenderIdentities(
+      item.workspace,
+      item.privateProfile
+    );
+    const senderName =
+      item.senderName ||
+      item.workspace?.senderName ||
+      item.workspace?.name ||
+      'FlowPilot Workspace';
+    const resolvedFrom =
+      item.fromIdentity ||
+      (item.channel === 'whatsapp'
+        ? identities.whatsappBusinessNumber
+        : item.channel === 'email'
+        ? identities.activeEmailMode === 'custom_domain'
+          ? identities.activeSenderEmail
+          : connectedGmail || identities.activeSenderEmail
+        : identities.smsSenderId);
+
+    return {
+      ...item,
+      fromIdentity: resolvedFrom,
+      senderName,
+      replyToEmail:
+        item.replyToEmail ||
+        item.privateProfile?.replyToEmail ||
+        connectedGmail ||
+        identities.activeSenderEmail,
+      webhookUrl,
+      gmailAccessToken: gmailToken || undefined,
+      whatsappConnector: storedGateways.whatsapp,
+      smsConnector: storedGateways.sms,
+      emailConnector: storedGateways.email,
+    };
+  });
+
+  try {
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (gmailToken) {
+      headers.Authorization = `Bearer ${gmailToken}`;
+    }
+    const res = await fetch('/api/scheduler/enqueue', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ jobs: preparedJobs }),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      return {
+        createdJobs: Array.isArray(data.createdJobs) ? data.createdJobs : [],
+        summary: data.summary || {
+          queuedCount: 0,
+          dispatchedCount: 0,
+          haltedKillSwitchCount: 0,
+          totalCount: 0,
+        },
+        jobs: Array.isArray(data.jobs) ? data.jobs : [],
+      };
+    }
+  } catch {
+    // Ignore offline error
+  }
+  return {
+    createdJobs: [],
+    summary: {
+      queuedCount: 0,
+      dispatchedCount: 0,
+      haltedKillSwitchCount: 0,
+      totalCount: 0,
+    },
+    jobs: [],
+  };
+}
+
+export async function syncKillSwitchWithServerScheduler(params: {
+  contacts?: Array<{
+    id?: string;
+    email?: string;
+    phone?: string;
+    fullName?: string;
+    listName?: string;
+    tags: string[];
+  }>;
+  lists?: Array<{
+    name: string;
+    killSwitchEnabled: boolean;
+    killSwitchTags: string[];
+  }>;
+}): Promise<{
+  haltedCount: number;
+  haltedJobs: ScheduledAutomationJob[];
+  summary: SchedulerSummary;
+  jobs: ScheduledAutomationJob[];
+}> {
+  try {
+    const res = await fetch('/api/scheduler/sync-kill-switch', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(params),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      return {
+        haltedCount: Number(data.haltedCount) || 0,
+        haltedJobs: Array.isArray(data.haltedJobs) ? data.haltedJobs : [],
+        summary: data.summary || {
+          queuedCount: 0,
+          dispatchedCount: 0,
+          haltedKillSwitchCount: 0,
+          totalCount: 0,
+        },
+        jobs: Array.isArray(data.jobs) ? data.jobs : [],
+      };
+    }
+  } catch {
+    // Ignore offline error
+  }
+  return {
+    haltedCount: 0,
+    haltedJobs: [],
+    summary: {
+      queuedCount: 0,
+      dispatchedCount: 0,
+      haltedKillSwitchCount: 0,
+      totalCount: 0,
+    },
+    jobs: [],
+  };
+}
+
+export async function triggerScheduledJobNow(jobId: string): Promise<{
+  job?: ScheduledAutomationJob;
+  summary: SchedulerSummary;
+  jobs: ScheduledAutomationJob[];
+}> {
+  try {
+    const res = await fetch('/api/scheduler/trigger-now', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ jobId }),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      return {
+        job: data.job,
+        summary: data.summary || {
+          queuedCount: 0,
+          dispatchedCount: 0,
+          haltedKillSwitchCount: 0,
+          totalCount: 0,
+        },
+        jobs: Array.isArray(data.jobs) ? data.jobs : [],
+      };
+    }
+  } catch {
+    // Ignore error
+  }
+  return fetchScheduledJobs();
+}
+
+export async function cancelScheduledJob(params: {
+  jobId?: string;
+  clearCompleted?: boolean;
+}): Promise<{
+  summary: SchedulerSummary;
+  jobs: ScheduledAutomationJob[];
+}> {
+  try {
+    const res = await fetch('/api/scheduler/cancel', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(params),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      return {
+        summary: data.summary || {
+          queuedCount: 0,
+          dispatchedCount: 0,
+          haltedKillSwitchCount: 0,
+          totalCount: 0,
+        },
+        jobs: Array.isArray(data.jobs) ? data.jobs : [],
+      };
+    }
+  } catch {
+    // Ignore error
+  }
+  return fetchScheduledJobs();
+}
+
+export interface InboundWebhookPayloadItem {
+  id: string;
+  channel: ChannelType;
+  leadName: string;
+  leadEmail: string;
+  leadPhone: string;
+  message: string;
+  subject?: string;
+  listName?: string;
+  receivedAt: string;
+}
+
+export async function pollAndConsumeInboundWebhooks(): Promise<InboundWebhookPayloadItem[]> {
+  try {
+    const res = await fetch('/api/webhooks/inbound?consume=true');
+    if (res.ok) {
+      const data = await res.json();
+      if (Array.isArray(data?.items) && data.items.length > 0) {
+        return data.items as InboundWebhookPayloadItem[];
+      }
+    }
+  } catch {
+    // Ignore polling error if offline
+  }
+  return [];
+}
