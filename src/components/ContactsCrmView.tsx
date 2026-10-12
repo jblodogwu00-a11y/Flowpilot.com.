@@ -261,7 +261,8 @@ export const ContactsCrmView: React.FC<ContactsCrmViewProps> = ({
       qualified: 4,
       warm_lead: 3,
       lead: 2,
-      churned: 1,
+      cold_subscriber: 1,
+      churned: 0,
     };
 
     return [...filtered].sort((a, b) => {

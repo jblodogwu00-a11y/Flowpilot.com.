@@ -142,7 +142,8 @@ export type EmailProviderMode =
   | 'builtin_relay'
   | 'gmail_oauth'
   | 'resend_api'
-  | 'sendgrid_api';
+  | 'sendgrid_api'
+  | 'smtp';
 
 export interface WhatsAppGatewayConnectorConfig {
   providerMode: WhatsAppProviderMode;
@@ -172,6 +173,11 @@ export interface EmailGatewayConnectorConfig {
   providerMode: EmailProviderMode;
   resendApiKey?: string;
   sendgridApiKey?: string;
+  smtpHost?: string;
+  smtpPort?: number | string;
+  smtpUser?: string;
+  smtpPass?: string;
+  fromEmail?: string;
 }
 
 export interface ChannelGatewayRuntimeConfig {
@@ -227,6 +233,11 @@ const DEFAULT_GATEWAY_RUNTIME_CONFIG: ChannelGatewayRuntimeConfig = {
     providerMode: 'builtin_relay',
     resendApiKey: '',
     sendgridApiKey: '',
+    smtpHost: '',
+    smtpPort: 587,
+    smtpUser: '',
+    smtpPass: '',
+    fromEmail: '',
   },
 };
 
@@ -350,6 +361,8 @@ export function getEmailProviderLabel(mode: EmailProviderMode): string {
       return 'Resend Transactional Email API (Live Connector)';
     case 'sendgrid_api':
       return 'SendGrid Email API (Live Connector)';
+    case 'smtp':
+      return 'SMTP Email Gateway (Connected)';
     default:
       return 'FlowPilot Verified Email Relay + Direct Mail Bridge';
   }

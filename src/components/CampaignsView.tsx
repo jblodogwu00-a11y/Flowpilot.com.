@@ -488,6 +488,9 @@ export const CampaignsView: React.FC<CampaignsViewProps> = ({
         email: privateProfile.email,
         replyToEmail: privateProfile.replyToEmail,
         phone: sanitizeString(smsSenderNumber, 40, privateProfile.phone),
+        mailingAddress: privateProfile.mailingAddress || '',
+        whatsappPhoneId: privateProfile.whatsappPhoneId || '',
+        smsSenderId: sanitizeString(smsSenderNumber, 40, privateProfile.smsSenderId || 'FLOWPILOT'),
         whatsappBusinessPhone: privateProfile.whatsappBusinessPhone,
         emailProviderDomain: privateProfile.emailProviderDomain,
         dailySendCap: privateProfile.dailySendCap,
@@ -613,7 +616,7 @@ export const CampaignsView: React.FC<CampaignsViewProps> = ({
     const baseChannels = contact.commChannels || ['email'];
     const nextChannels: ChannelType[] = grantOptIn
       ? (Array.from(new Set([...baseChannels, 'sms'])) as ChannelType[])
-      : baseChannels.filter((ch) => ch !== 'sms');
+      : (baseChannels.filter((ch) => ch !== 'sms') as ChannelType[]);
     const nextTags = grantOptIn
       ? (contact.tags || []).filter((t) => t !== 'sms-stop-optout' && t !== 'suppressed')
       : Array.from(new Set([...(contact.tags || []), 'sms-stop-optout'])).slice(0, 10);
@@ -1252,6 +1255,11 @@ export const CampaignsView: React.FC<CampaignsViewProps> = ({
         currency: workspace.currency,
         timezone: workspace.timezone,
         senderName: sanitizeString(senderNameInput, 100, workspace.senderName),
+        whatsappConnected: workspace.whatsappConnected,
+        smsConnected: workspace.smsConnected,
+        emailConnected: workspace.emailConnected,
+        notifyNewLeads: workspace.notifyNewLeads,
+        notifyCampaigns: workspace.notifyCampaigns,
         sendingDomainStatus: 'verified',
         whatsappWebhookStatus: workspace.whatsappWebhookStatus,
       });
@@ -1261,6 +1269,9 @@ export const CampaignsView: React.FC<CampaignsViewProps> = ({
         email: sanitizeString(fromEmailInput, 150, privateProfile.email),
         replyToEmail: sanitizeString(replyToEmailInput, 150, privateProfile.replyToEmail),
         phone: privateProfile.phone,
+        mailingAddress: privateProfile.mailingAddress || '',
+        whatsappPhoneId: privateProfile.whatsappPhoneId || '',
+        smsSenderId: privateProfile.smsSenderId || 'FLOWPILOT',
         whatsappBusinessPhone: privateProfile.whatsappBusinessPhone,
         emailProviderDomain: sanitizeString(
           sendingDomainInput,
@@ -2826,7 +2837,7 @@ export const CampaignsView: React.FC<CampaignsViewProps> = ({
           <form onSubmit={handleSaveSenderConfig} className="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs">
             <div>
               <label className="block font-bold text-slate-700 mb-1">
-                From Sender Name ({{sender_name}}) *
+                From Sender Name ({'{{sender_name}}'}) *
               </label>
               <input
                 type="text"

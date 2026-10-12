@@ -258,6 +258,36 @@ export function buildStarterWorkspaceSnapshot(
   };
 }
 
+export function normalizeWorkspaceSnapshot(snap: Partial<WorkspaceSnapshot>): WorkspaceSnapshot {
+  const uid = snap.workspace?.id || snap.workspace?.ownerId || 'ws_default';
+  const ownerEmail = snap.privateProfile?.email || 'operator@flowpilot.app';
+  const ownerName = snap.workspace?.senderName || snap.workspace?.name || 'Workspace Owner';
+  const starter = buildStarterWorkspaceSnapshot(uid, ownerEmail, ownerName, snap.workspace?.name);
+
+  return {
+    workspace: {
+      ...starter.workspace,
+      ...(snap.workspace || {}),
+    },
+    privateProfile: {
+      ...starter.privateProfile,
+      ...(snap.privateProfile || {}),
+    },
+    members: Array.isArray(snap.members) ? snap.members : starter.members,
+    contacts: Array.isArray(snap.contacts) ? snap.contacts : [],
+    lists: Array.isArray(snap.lists) && snap.lists.length > 0 ? snap.lists : starter.lists,
+    automations: Array.isArray(snap.automations) ? snap.automations : [],
+    autoResponders: Array.isArray(snap.autoResponders) ? snap.autoResponders : [],
+    inboxThreads: Array.isArray(snap.inboxThreads) ? snap.inboxThreads : [],
+    campaigns: Array.isArray(snap.campaigns) ? snap.campaigns : [],
+    assets: Array.isArray(snap.assets) ? snap.assets : [],
+    chatbots: Array.isArray(snap.chatbots) ? snap.chatbots : [],
+    tasks: Array.isArray(snap.tasks) ? snap.tasks : [],
+    activities: Array.isArray(snap.activities) ? snap.activities : [],
+    updatedAt: snap.updatedAt || new Date().toISOString(),
+  };
+}
+
 export function loadLocalWorkspaceSnapshot(
   uid: string,
   email?: string
@@ -267,7 +297,7 @@ export function loadLocalWorkspaceSnapshot(
       const rawByUid = localStorage.getItem(`${WORKSPACE_SNAPSHOT_PREFIX}${uid}`);
       if (rawByUid) {
         const parsed = JSON.parse(rawByUid);
-        if (parsed && parsed.workspace) return parsed as WorkspaceSnapshot;
+        if (parsed && parsed.workspace) return normalizeWorkspaceSnapshot(parsed);
       }
     }
     if (email && uid !== 'guest_sandbox') {
@@ -277,7 +307,7 @@ export function loadLocalWorkspaceSnapshot(
       const rawByEmail = localStorage.getItem(emailKey);
       if (rawByEmail) {
         const parsed = JSON.parse(rawByEmail);
-        if (parsed && parsed.workspace) return parsed as WorkspaceSnapshot;
+        if (parsed && parsed.workspace) return normalizeWorkspaceSnapshot(parsed);
       }
     }
     return null;
@@ -323,7 +353,7 @@ export async function fetchServerWorkspaceSnapshot(
     if (res.ok) {
       const data = await res.json();
       if (data?.snapshot && data.snapshot.workspace) {
-        return data.snapshot as WorkspaceSnapshot;
+        return normalizeWorkspaceSnapshot(data.snapshot);
       }
     }
   } catch {

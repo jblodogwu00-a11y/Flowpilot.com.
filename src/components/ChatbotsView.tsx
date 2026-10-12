@@ -150,6 +150,11 @@ export const ChatbotsView: React.FC<ChatbotsViewProps> = ({
     currency: 'USD',
     timezone: 'America/New_York',
     senderName: 'FlowPilot Team',
+    whatsappConnected: true,
+    smsConnected: true,
+    emailConnected: true,
+    notifyNewLeads: true,
+    notifyCampaigns: true,
     whatsappPhoneId: '104928193847291',
     smsSenderId: '+18445550199',
   };
@@ -342,7 +347,13 @@ export const ChatbotsView: React.FC<ChatbotsViewProps> = ({
   );
 
   const whatsappAutomations = useMemo(
-    () => automations.filter((a) => a.channel === 'whatsapp' || a.channel === 'multi'),
+    () =>
+      automations.filter(
+        (a) =>
+          (a.channels || []).includes('whatsapp') ||
+          a.channel === 'whatsapp' ||
+          (a.channel as any) === 'multi'
+      ),
     [automations]
   );
 
@@ -888,6 +899,11 @@ export const ChatbotsView: React.FC<ChatbotsViewProps> = ({
           currency: effectiveWorkspace.currency,
           timezone: businessHours.timezone || effectiveWorkspace.timezone,
           senderName: effectiveWorkspace.senderName,
+          whatsappConnected: effectiveWorkspace.whatsappConnected,
+          smsConnected: effectiveWorkspace.smsConnected,
+          emailConnected: effectiveWorkspace.emailConnected,
+          notifyNewLeads: effectiveWorkspace.notifyNewLeads,
+          notifyCampaigns: effectiveWorkspace.notifyCampaigns,
           whatsappPhoneId: sanitizeString(phoneNumberId, 80, '104928193847291'),
           smsSenderId: effectiveWorkspace.smsSenderId,
         });
@@ -896,6 +912,11 @@ export const ChatbotsView: React.FC<ChatbotsViewProps> = ({
         await onUpdatePrivateProfile({
           email: privateProfile.email,
           replyToEmail: privateProfile.replyToEmail,
+          phone: privateProfile.phone,
+          mailingAddress: privateProfile.mailingAddress || '',
+          whatsappPhoneId: sanitizeString(phoneNumberId, 80, privateProfile.whatsappPhoneId || '104928193847291'),
+          smsSenderId: privateProfile.smsSenderId || '+18445550199',
+          emailProviderDomain: privateProfile.emailProviderDomain || '',
           sendingDomain: privateProfile.sendingDomain,
           espProvider: privateProfile.espProvider,
           espApiKey: privateProfile.espApiKey,
@@ -1934,9 +1955,17 @@ export const ChatbotsView: React.FC<ChatbotsViewProps> = ({
                       await onCreateAutomation({
                         name: 'WhatsApp Consultation Reminder Sequence',
                         triggerType: 'booking_requested',
+                        triggerDetail: 'Discovery Call Requested in CRM',
+                        targetList: lists[0]?.name || 'Creator Launch Waitlist',
                         targetListName: lists[0]?.name || 'Creator Launch Waitlist',
+                        channels: ['whatsapp'],
                         channel: 'whatsapp',
                         status: 'active',
+                        stepsSummary: [
+                          'Trigger: Discovery Call Requested in CRM',
+                          'Verify WhatsApp Opt-In & 24h Window / Template Status',
+                          'Send Approved Template: consultation_booking_reminder_24h',
+                        ],
                         steps: [
                           'Trigger: Discovery Call Requested in CRM',
                           'Verify WhatsApp Opt-In & 24h Window / Template Status',
@@ -1967,13 +1996,13 @@ export const ChatbotsView: React.FC<ChatbotsViewProps> = ({
                     <span aria-hidden="true"> · </span>
                     <span className="font-mono">Trigger: {wf.triggerType}</span>
                     <span aria-hidden="true"> · </span>
-                    <span>List: {wf.targetListName}</span>
+                    <span>List: {wf.targetListName || wf.targetList}</span>
                   </div>
                   <h4 className="font-display text-sm sm:text-base font-bold text-slate-950">
                     {wf.name}
                   </h4>
                   <div className="space-y-1 text-xs text-slate-600 bg-[#F8FAFC] p-3 rounded-xl border border-slate-200">
-                    {wf.steps.map((st, i) => (
+                    {(wf.steps || wf.stepsSummary || []).map((st: string, i: number) => (
                       <div key={i} className="truncate">
                         {i + 1}. {st}
                       </div>

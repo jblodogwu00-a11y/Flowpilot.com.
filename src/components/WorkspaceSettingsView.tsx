@@ -367,6 +367,21 @@ export const WorkspaceSettingsView: React.FC<WorkspaceSettingsViewProps> = ({
   const [sendgridApiKey, setSendgridApiKey] = useState(() =>
     getStoredChannelGatewayConfig().email.sendgridApiKey || ''
   );
+  const [smtpHost, setSmtpHost] = useState(() =>
+    getStoredChannelGatewayConfig().email.smtpHost || ''
+  );
+  const [smtpPort, setSmtpPort] = useState<number | string>(() =>
+    getStoredChannelGatewayConfig().email.smtpPort || 587
+  );
+  const [smtpUser, setSmtpUser] = useState(() =>
+    getStoredChannelGatewayConfig().email.smtpUser || ''
+  );
+  const [smtpPass, setSmtpPass] = useState(() =>
+    getStoredChannelGatewayConfig().email.smtpPass || ''
+  );
+  const [smtpFromEmail, setSmtpFromEmail] = useState(() =>
+    getStoredChannelGatewayConfig().email.fromEmail || ''
+  );
 
   const persistCurrentGatewayConnectors = (
     overrideWaMode?: WhatsAppProviderMode,
@@ -403,6 +418,11 @@ export const WorkspaceSettingsView: React.FC<WorkspaceSettingsViewProps> = ({
         providerMode: nextEmailMode,
         resendApiKey: resendApiKey.trim(),
         sendgridApiKey: sendgridApiKey.trim(),
+        smtpHost: smtpHost.trim(),
+        smtpPort: Number(smtpPort) || 587,
+        smtpUser: smtpUser.trim(),
+        smtpPass: smtpPass.trim(),
+        fromEmail: smtpFromEmail.trim(),
       },
     });
     fetchGatewayStatus().then((status) => setGatewayStatus(status));
@@ -1999,6 +2019,9 @@ export const WorkspaceSettingsView: React.FC<WorkspaceSettingsViewProps> = ({
                     <option value="sendgrid_api">
                       Twilio SendGrid Email API (High-Volume Transactional)
                     </option>
+                    <option value="smtp">
+                      Standard SMTP Transport (Nodemailer: Postmark / SES / Mailgun / Custom)
+                    </option>
                   </select>
 
                   {emailProviderMode === 'resend_api' && (
@@ -2020,6 +2043,54 @@ export const WorkspaceSettingsView: React.FC<WorkspaceSettingsViewProps> = ({
                         value={sendgridApiKey}
                         onChange={(e) => setSendgridApiKey(e.target.value)}
                         placeholder="SendGrid Live API Key (SG....)"
+                        className="w-full px-2.5 py-1.5 text-xs font-mono bg-white border border-slate-300 rounded-lg text-slate-900"
+                      />
+                    </div>
+                  )}
+
+                  {emailProviderMode === 'smtp' && (
+                    <div className="space-y-2 pt-1">
+                      <div className="grid grid-cols-3 gap-2">
+                        <div className="col-span-2">
+                          <input
+                            type="text"
+                            value={smtpHost}
+                            onChange={(e) => setSmtpHost(e.target.value)}
+                            placeholder="SMTP Host (smtp.mailgun.org)"
+                            className="w-full px-2.5 py-1.5 text-xs font-mono bg-white border border-slate-300 rounded-lg text-slate-900"
+                          />
+                        </div>
+                        <div>
+                          <input
+                            type="number"
+                            value={smtpPort}
+                            onChange={(e) => setSmtpPort(e.target.value)}
+                            placeholder="Port (587)"
+                            className="w-full px-2.5 py-1.5 text-xs font-mono bg-white border border-slate-300 rounded-lg text-slate-900"
+                          />
+                        </div>
+                      </div>
+                      <div className="grid grid-cols-2 gap-2">
+                        <input
+                          type="text"
+                          value={smtpUser}
+                          onChange={(e) => setSmtpUser(e.target.value)}
+                          placeholder="SMTP Username / API Key"
+                          className="w-full px-2.5 py-1.5 text-xs font-mono bg-white border border-slate-300 rounded-lg text-slate-900"
+                        />
+                        <input
+                          type="password"
+                          value={smtpPass}
+                          onChange={(e) => setSmtpPass(e.target.value)}
+                          placeholder="SMTP Password / Secret"
+                          className="w-full px-2.5 py-1.5 text-xs font-mono bg-white border border-slate-300 rounded-lg text-slate-900"
+                        />
+                      </div>
+                      <input
+                        type="email"
+                        value={smtpFromEmail}
+                        onChange={(e) => setSmtpFromEmail(e.target.value)}
+                        placeholder="From Email (e.g. hello@yourdomain.com)"
                         className="w-full px-2.5 py-1.5 text-xs font-mono bg-white border border-slate-300 rounded-lg text-slate-900"
                       />
                     </div>

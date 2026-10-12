@@ -54,12 +54,17 @@ import {
   UserMessagingIdentity,
   parseSavedMessagingIdentities,
   sanitizeString,
+  sanitizeStringArray,
   resolveWorkspaceSenderIdentities,
 } from '../types';
 import {
   deliverChannelMessage,
   personalizeAutomationMessage,
   MessageDeliveryReceipt,
+  getStoredChannelGatewayConfig,
+  getWhatsAppProviderLabel,
+  getEmailProviderLabel,
+  getSmsProviderLabel,
 } from '../services/messageDeliveryService';
 import {
   TRIGGER_CATALOG,
@@ -231,8 +236,14 @@ export const AutomationsView: React.FC<AutomationsViewProps> = ({
   const [customTestPhone, setCustomTestPhone] = useState<string>(
     privateProfile?.phone || '+1 (555) 234-8910'
   );
+  const storedGateways = React.useMemo(() => getStoredChannelGatewayConfig(), []);
   const [isLiveRunnerOpen, setIsLiveRunnerOpen] = useState<boolean>(false);
   const [isExecutingJob, setIsExecutingJob] = useState<boolean>(false);
+  const [testingStepNodeId, setTestingStepNodeId] = useState<string | null>(null);
+  const [lastStepReceipt, setLastStepReceipt] = useState<{
+    nodeId: string;
+    receipt: MessageDeliveryReceipt;
+  } | null>(null);
   const [latestExecutionReceipts, setLatestExecutionReceipts] = useState<MessageDeliveryReceipt[]>(
     []
   );
@@ -652,6 +663,88 @@ export const AutomationsView: React.FC<AutomationsViewProps> = ({
     setHasUnsavedChanges(true);
     setIsMessageComposerOpen(false);
     showNotice(`Added "${cleanTitle}" (${scheduleDesc}) to workflow canvas`);
+  };
+
+  // Test send a single message step (WhatsApp, Email, SMS) directly to the user's test device
+  const handleTestSingleMessageNode = async (node: WorkflowNode) => {
+    if (testingStepNodeId) return;
+    const stepChannel: ChannelType =
+      node.subType === 'send_whatsapp'
+        ? 'whatsapp'
+        : node.subType === 'send_sms'
+        ? 'sms'
+        : 'email';
+
+    const testRecipient =
+      stepChannel === 'email'
+        ? customTestEmail || privateProfile?.email || 'lead@example.com'
+        : customTestPhone ||
+          privateProfile?.whatsappBusinessNumber ||
+          privateProfile?.phone ||
+          '+1 (555) 234-8910';
+
+    const rawSubject =
+      node.config.subjectOrTemplate ||
+      (stepChannel === 'whatsapp'
+        ? 'wa_automated_step'
+        : stepChannel === 'sms'
+        ? 'Automated SMS Alert'
+        : activeWorkflow?.name || 'FlowPilot Automation');
+
+    const rawBody =
+      node.config.messagePreview ||
+      `Hi {{first_name}}, this is an automated ${stepChannel.toUpperCase()} message from ${
+        activeWorkflow?.name || 'FlowPilot'
+      }.`;
+
+    const leadName = customTestName || 'Test Lead';
+    const activeWorkflowList = resolveAutomationTargetList(activeWorkflow);
+    const personalizedSubject = personalizeAutomationMessage(rawSubject, {
+      fullName: leadName,
+      email: testRecipient,
+      phone: testRecipient,
+      company: 'Growth Partner',
+      listName: activeWorkflowList || 'VIP Contacts',
+      senderName: workspace?.senderName || workspace?.name,
+      automationId: activeWorkflow?.id,
+    });
+
+    const personalizedBody = personalizeAutomationMessage(rawBody, {
+      fullName: leadName,
+      email: testRecipient,
+      phone: testRecipient,
+      company: 'Growth Partner',
+      listName: activeWorkflowList || 'VIP Contacts',
+      senderName: workspace?.senderName || workspace?.name,
+      automationId: activeWorkflow?.id,
+    });
+
+    setTestingStepNodeId(node.id);
+    try {
+      const receipt = await deliverChannelMessage({
+        channel: stepChannel,
+        to: testRecipient,
+        leadName,
+        subject: personalizedSubject,
+        body: personalizedBody,
+        listName: activeWorkflowList || 'VIP Contacts',
+        source: 'automation_workflow',
+        overrideFromIdentity: node.config.overrideFromIdentity,
+        workspace,
+        privateProfile,
+      });
+
+      setLastStepReceipt({ nodeId: node.id, receipt });
+      showNotice(
+        `Live ${stepChannel.toUpperCase()} sent to ${receipt.toRecipient} via ${
+          receipt.providerUsed
+        }! (Receipt: ${receipt.receiptId})`
+      );
+    } catch {
+      showNotice(`Failed to deliver ${stepChannel.toUpperCase()} test message.`);
+    } finally {
+      setTestingStepNodeId(null);
+    }
   };
 
   // Save & Publish New Version to Firestore
@@ -2786,23 +2879,83 @@ export const AutomationsView: React.FC<AutomationsViewProps> = ({
                                       </span>
                                     )}
                                     {node.subType === 'send_whatsapp' && (
-                                      <span className="text-[10px] font-mono px-2 py-0.5 rounded-md bg-emerald-950 text-emerald-300 font-bold">
-                                        From WhatsApp: {senderIdentities.whatsappBusinessNumber}
-                                      </span>
+                                      <>
+                                        <span className="text-[10px] font-mono px-2 py-0.5 rounded-md bg-emerald-950 text-emerald-300 font-bold">
+                                          From WhatsApp: {senderIdentities.whatsappBusinessNumber}
+                                        </span>
+                                        <span className="text-[10px] font-mono px-2 py-0.5 rounded-md bg-emerald-100 text-emerald-900 border border-emerald-300 font-bold">
+                                          Gateway: {getWhatsAppProviderLabel(storedGateways.whatsapp.providerMode)}
+                                        </span>
+                                      </>
                                     )}
                                     {node.subType === 'send_email' && (
-                                      <span className="text-[10px] font-mono px-2 py-0.5 rounded-md bg-slate-900 text-emerald-300 font-bold">
-                                        From Email: {senderIdentities.activeSenderEmail} (
-                                        {senderIdentities.activeEmailMode === 'custom_domain'
-                                          ? 'Custom Domain'
-                                          : 'Platform Email'}
-                                        )
-                                      </span>
+                                      <>
+                                        <span className="text-[10px] font-mono px-2 py-0.5 rounded-md bg-slate-900 text-emerald-300 font-bold">
+                                          From Email: {senderIdentities.activeSenderEmail} (
+                                          {senderIdentities.activeEmailMode === 'custom_domain'
+                                            ? 'Custom Domain'
+                                            : 'Platform Email'}
+                                          )
+                                        </span>
+                                        <span className="text-[10px] font-mono px-2 py-0.5 rounded-md bg-slate-100 text-slate-800 border border-slate-300 font-bold">
+                                          Gateway: {getEmailProviderLabel(storedGateways.email.providerMode)}
+                                        </span>
+                                      </>
                                     )}
                                     {node.subType === 'send_sms' && (
-                                      <span className="text-[10px] font-mono px-2 py-0.5 rounded-md bg-slate-800 text-emerald-300 font-bold">
-                                        From SMS ID: {senderIdentities.smsSenderId}
-                                      </span>
+                                      <>
+                                        <span className="text-[10px] font-mono px-2 py-0.5 rounded-md bg-slate-800 text-emerald-300 font-bold">
+                                          From SMS ID: {senderIdentities.smsSenderId}
+                                        </span>
+                                        <span className="text-[10px] font-mono px-2 py-0.5 rounded-md bg-amber-100 text-amber-900 border border-amber-300 font-bold">
+                                          Gateway: {getSmsProviderLabel(storedGateways.sms.providerMode)}
+                                        </span>
+                                      </>
+                                    )}
+                                    {(node.subType === 'send_email' ||
+                                      node.subType === 'send_whatsapp' ||
+                                      node.subType === 'send_sms') && (
+                                      <div
+                                        onClick={(e) => e.stopPropagation()}
+                                        className="flex flex-wrap items-center gap-1.5"
+                                      >
+                                        <button
+                                          type="button"
+                                          disabled={testingStepNodeId === node.id}
+                                          onClick={(e) => {
+                                            e.stopPropagation();
+                                            void handleTestSingleMessageNode(node);
+                                          }}
+                                          className="px-2.5 py-1 text-[10px] font-bold bg-[#0F172A] hover:bg-slate-800 text-white rounded-md inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-50 transition-colors"
+                                          title="Send a live test message of this step to your device"
+                                        >
+                                          <Send className="w-3 h-3 text-emerald-400" />
+                                          <span>
+                                            {testingStepNodeId === node.id
+                                              ? 'Sending Live...'
+                                              : 'Send Live Test to Me'}
+                                          </span>
+                                        </button>
+                                        {lastStepReceipt?.nodeId === node.id && (
+                                          <span className="text-[10px] text-emerald-800 font-bold bg-emerald-50 px-2 py-0.5 rounded border border-emerald-300 inline-flex items-center gap-1">
+                                            <CheckCircle2 className="w-3 h-3 text-emerald-600" />
+                                            <span>
+                                              Delivered to {lastStepReceipt.receipt.toRecipient} (
+                                              {lastStepReceipt.receipt.providerUsed})
+                                            </span>
+                                            {lastStepReceipt.receipt.directLaunchUrl && (
+                                              <a
+                                                href={lastStepReceipt.receipt.directLaunchUrl}
+                                                target="_blank"
+                                                rel="noopener noreferrer"
+                                                className="underline hover:text-emerald-950 ml-1 inline-flex items-center gap-0.5"
+                                              >
+                                                Open <ExternalLink className="w-2.5 h-2.5" />
+                                              </a>
+                                            )}
+                                          </span>
+                                        )}
+                                      </div>
                                     )}
                                     {(node.subType === 'send_email' ||
                                       node.subType === 'send_whatsapp' ||

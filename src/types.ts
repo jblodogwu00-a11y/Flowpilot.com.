@@ -9,7 +9,7 @@ export type CurrencyCode = 'USD' | 'EUR' | 'GBP' | 'NGN' | 'CAD';
 export type MemberRole = 'owner' | 'admin' | 'editor' | 'analyst';
 export type MemberStatus = 'active' | 'invited' | 'revoked';
 
-export type ContactStage = 'lead' | 'warm_lead' | 'qualified' | 'customer' | 'churned';
+export type ContactStage = 'lead' | 'warm_lead' | 'qualified' | 'customer' | 'churned' | 'cold_subscriber';
 export type LeadTemperature = 'hot' | 'warm' | 'cold';
 export type ConsentStatus = 'opted_in' | 'pending_double_opt_in' | 'unsubscribed';
 
@@ -27,7 +27,8 @@ export type TriggerType =
   | 'webhook_received'
   | 'manual_enrollment'
   | 'purchase_completed'
-  | 'whatsapp_keyword';
+  | 'whatsapp_keyword'
+  | 'booking_requested';
 
 export type WorkflowNodeCategory = 'trigger' | 'action' | 'condition' | 'delay';
 
@@ -69,6 +70,7 @@ export interface WorkflowNode {
   title: string;
   subtitle: string;
   branchPath: BranchPathType;
+  stepOrder?: number;
   config: {
     // Messaging / Action parameters
     channel?: 'email' | 'whatsapp' | 'sms' | 'crm' | 'webhook';
@@ -97,6 +99,8 @@ export interface WorkflowNode {
     scheduledSendTime?: string;
     delayAmount?: number;
     delayUnit?: DelayUnit;
+    waitDurationAmount?: number;
+    waitDurationUnit?: DelayUnit;
     specificDateTime?: string;
     businessDaysOnly?: boolean;
     businessWindowStart?: string;
@@ -137,11 +141,17 @@ export interface WorkflowEngineConfig {
 
 export interface CsvImportOptions {
   applyTags: string[];
-  updateExistingContacts: boolean;
-  createUnmatchedContacts: boolean;
-  matchColumnType: 'auto' | 'email' | 'phone' | 'full_csv';
+  updateExistingContacts?: boolean;
+  createUnmatchedContacts?: boolean;
+  matchColumnType?: 'auto' | 'email' | 'phone' | 'full_csv';
+  columnMapping?: 'auto' | 'email' | 'phone' | 'full_csv';
   upgradeStageToCustomer?: boolean;
+  targetListName?: string;
 }
+
+export type ContactList = AudienceList;
+export type AutomationFlow = Automation;
+export type LeadStage = ContactStage;
 
 export interface CsvImportResultSummary {
   updatedCount: number;
@@ -214,18 +224,20 @@ export type TaskCategory =
   | 'follow_up'
   | 'campaign_review'
   | 'compliance_check'
-  | 'onboarding';
+  | 'onboarding'
+  | 'whatsapp';
 export type TaskPriority = 'high' | 'medium' | 'low';
 export type TaskStatus = 'pending' | 'in_progress' | 'completed';
 
 export type ActivityEventType =
   | 'lead_captured'
+  | 'form_captured'
   | 'automation_triggered'
   | 'campaign_sent'
   | 'whatsapp_replied'
   | 'stage_converted'
   | 'asset_published';
-export type ActivityChannel = 'email' | 'whatsapp' | 'sms' | 'web' | 'crm';
+export type ActivityChannel = 'email' | 'whatsapp' | 'sms' | 'web' | 'crm' | 'system';
 
 export interface Workspace {
   id: string;
@@ -240,6 +252,10 @@ export interface Workspace {
   emailConnected: boolean;
   notifyNewLeads: boolean;
   notifyCampaigns: boolean;
+  whatsappPhoneId?: string;
+  smsSenderId?: string;
+  sendingDomainStatus?: string;
+  whatsappWebhookStatus?: string;
   createdAt?: Timestamp | string;
   updatedAt?: Timestamp | string;
 }
@@ -253,6 +269,7 @@ export interface UserMessagingIdentity {
   displayName?: string;
   replyToEmail?: string;
   providerMode?: string;
+  providerType?: string;
   isDefault?: boolean;
   isPrimary?: boolean;
   verified: boolean;
@@ -271,6 +288,13 @@ export interface UserPrivateProfile {
   emailProviderDomain: string;
   whatsappBusinessNumber?: string;
   whatsappBusinessPhone?: string;
+  whatsappAccessToken?: string;
+  sendingDomain?: string;
+  espProvider?: string;
+  espApiKey?: string;
+  smsProvider?: string;
+  smsApiKey?: string;
+  onboardingCompleted?: boolean;
   dailySendCap?: number;
   customDomainEmail?: string;
   useCustomDomainEmail?: boolean;
@@ -324,8 +348,11 @@ export interface Automation {
   triggerType: TriggerType;
   triggerDetail: string;
   targetList?: string;
+  targetListName?: string;
   stepsSummary: string[];
+  steps?: string[];
   channels: string[];
+  channel?: ChannelType;
   status: AutomationStatus;
   enrolledCount: number;
   completedCount: number;
@@ -347,6 +374,7 @@ export interface Campaign {
   messageBody: string;
   status: CampaignStatus;
   recipientCount: number;
+  sentCount?: number;
   deliveredCount: number;
   openedCount: number;
   clickedCount: number;
@@ -354,6 +382,7 @@ export interface Campaign {
   unsubscribedCount?: number;
   preheader?: string;
   templateId?: string;
+  overrideFromIdentity?: string;
   segmentFilter?: string;
   scheduledAt?: string;
   blocksJson?: string;

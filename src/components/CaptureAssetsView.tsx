@@ -26,6 +26,11 @@ import {
   Edit3,
   Share2,
   Check,
+  Clock,
+  Play,
+  HelpCircle,
+  Palette,
+  RotateCcw,
 } from 'lucide-react';
 import {
   CaptureAsset,
@@ -192,10 +197,33 @@ export const CaptureAssetsView: React.FC<CaptureAssetsViewProps> = ({
   }, [lists, contacts]);
 
   // Selected Asset for the Drag-and-Drop Visual Editor & Preview
-  const [selectedAssetId, setSelectedAssetId] = useState<string>(assets[0]?.id || '');
+  const defaultDraftAsset: CaptureAsset = useMemo(
+    () => ({
+      id: 'draft_starter_asset',
+      workspaceId: 'ws_starter',
+      ownerId: 'owner_starter',
+      title: 'Sovereign Creator Academy & Offer Page (Starter Canvas)',
+      assetType: 'landing_page',
+      slug: 'sovereign-starter-canvas',
+      headline: 'Master the Architecture of High-Converting Digital Offers & Automated Funnels',
+      subheadline:
+        'Customize every block on this page or create a new page from scratch or ready-made template.',
+      ctaText: 'Unlock Instant Access →',
+      redirectUrl: 'https://flowpilot.app/thank-you',
+      toolFormat: 'landing_page',
+      targetList: allAvailableLists[0]?.name || 'General Contacts',
+      requireDoubleOptIn: false,
+      status: 'published',
+      viewsCount: 0,
+      submissionsCount: 0,
+    }),
+    [allAvailableLists]
+  );
+
+  const [selectedAssetId, setSelectedAssetId] = useState<string>(assets[0]?.id || 'draft_starter_asset');
   const activeBuilderAsset = useMemo(
-    () => assets.find((a) => a.id === selectedAssetId) || assets[0] || null,
-    [assets, selectedAssetId]
+    () => assets.find((a) => a.id === selectedAssetId) || assets[0] || defaultDraftAsset,
+    [assets, selectedAssetId, defaultDraftAsset]
   );
 
   const [viewportMode, setViewportMode] = useState<'desktop' | 'mobile'>('desktop');
@@ -377,6 +405,27 @@ export const CaptureAssetsView: React.FC<CaptureAssetsViewProps> = ({
     setModalSeoDesc(tpl.defaultSubheadline);
   };
 
+  const builderStartMode = modalBuildMode === 'scratch' ? 'from_scratch' : 'ready_template';
+  const setBuilderStartMode = (mode: 'from_scratch' | 'ready_template') => {
+    setModalBuildMode(mode === 'from_scratch' ? 'scratch' : 'template');
+  };
+  const selectedReadyTemplateId = selectedTemplateId;
+  const handleSelectModalReadyTemplate = (tpl: ReadyMadePageTemplate) => {
+    handleSelectReadyMadeTemplateInModal(tpl);
+  };
+
+  const handleUpdateBlockField = (
+    asset: CaptureAsset,
+    blockId: string,
+    patch: Partial<CanvasBlockItem>
+  ) => {
+    const meta = getExtendedForAsset(asset);
+    saveExtendedMeta(asset.slug, {
+      ...meta,
+      blocks: meta.blocks.map((b) => (b.id === blockId ? { ...b, ...patch } : b)),
+    });
+  };
+
   const handleLoadTemplateIntoActiveBuilder = async (tpl: ReadyMadePageTemplate) => {
     if (!activeBuilderAsset) {
       handleOpenCreateModal(tpl.toolFormat, 'template', tpl.id);
@@ -453,6 +502,31 @@ export const CaptureAssetsView: React.FC<CaptureAssetsViewProps> = ({
     setStatusBanner(
       `Reset "${activeBuilderAsset.title}" to a clean Build-From-Scratch canvas. Click any element in the palette to assemble your layout.`
     );
+  };
+
+  const handleSelectVisualTheme = (
+    assetOrTheme: CaptureAsset | PageVisualTheme,
+    maybeTheme?: PageVisualTheme
+  ) => {
+    const theme = (typeof assetOrTheme === 'string' ? assetOrTheme : maybeTheme) || 'classic_ivory';
+    const target = typeof assetOrTheme === 'object' && assetOrTheme ? assetOrTheme : activeBuilderAsset;
+    setModalVisualTheme(theme);
+    if (target) {
+      const meta = getExtendedForAsset(target);
+      saveExtendedMeta(target.slug, { ...meta, visualTheme: theme });
+    }
+  };
+
+  const handleApplyTemplateToActiveAsset = async (
+    assetOrTpl: CaptureAsset | ReadyMadePageTemplate,
+    maybeTpl?: ReadyMadePageTemplate
+  ) => {
+    const tpl = (maybeTpl || assetOrTpl) as ReadyMadePageTemplate;
+    await handleLoadTemplateIntoActiveBuilder(tpl);
+  };
+
+  const handleResetAssetToScratch = (_asset?: CaptureAsset) => {
+    handleResetActiveCanvasToScratch();
   };
 
   const handleOpenEditModal = (asset: CaptureAsset) => {

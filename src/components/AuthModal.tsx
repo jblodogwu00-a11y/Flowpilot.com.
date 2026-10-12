@@ -38,7 +38,7 @@ export type AuthModalMode = 'signin' | 'signup' | 'forgot' | 'verify_code';
 
 interface AuthModalProps {
   isOpen: boolean;
-  initialMode?: 'signin' | 'signup' | 'forgot';
+  initialMode?: AuthModalMode;
   onClose: () => void;
   onAuthSuccess: (options?: {
     uid?: string;

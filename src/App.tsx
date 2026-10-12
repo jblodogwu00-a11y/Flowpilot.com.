@@ -122,6 +122,7 @@ import { ChatbotsView } from './components/ChatbotsView';
 import { WorkspaceSettingsView } from './components/WorkspaceSettingsView';
 import { FlowPilotLogo } from './components/FlowPilotLogo';
 import { AuthModal, AuthModalMode } from './components/AuthModal';
+import { ErrorBoundary } from './components/ErrorBoundary';
 import {
   ThemeMode,
   getStoredThemeMode,
@@ -1409,9 +1410,12 @@ export default function App() {
         activeBranch = evalRes.branchPath;
         continue;
       }
-      if (node.category === 'wait') {
-        const waitVal = Math.max(1, Number(node.config.waitDurationValue) || 10);
-        const unit = node.config.waitDurationUnit || 'minutes';
+      if (node.category === 'delay' || (node.category as any) === 'wait') {
+        const waitVal = Math.max(
+          1,
+          Number(node.config.waitDurationAmount ?? (node.config as any).waitDurationValue ?? node.config.delayAmount) || 10
+        );
+        const unit = node.config.waitDurationUnit || node.config.delayUnit || 'minutes';
         const stepDelaySec =
           unit === 'minutes'
             ? waitVal * 60
@@ -1463,7 +1467,7 @@ export default function App() {
               automationId: auto.id,
               automationName: auto.name,
               stepId: node.id,
-              stepOrder: node.stepOrder,
+              stepOrder: node.stepOrder ?? 1,
               stepTitle: node.title,
               channel: stepChannel,
               contactId: fallbackContact?.id || `cnt_${Date.now()}`,
@@ -3502,7 +3506,12 @@ export default function App() {
 
         {/* Workspace Canvas */}
         <main className="flex-1 p-3.5 sm:p-6 lg:p-7 max-w-[1380px] w-full mx-auto">
-          {activeTab === 'dashboard' && (
+          <ErrorBoundary
+            key={activeTab}
+            fallbackTitle={`Unable to Load ${activeTab.charAt(0).toUpperCase() + activeTab.slice(1)}`}
+            onNavigateHome={() => setActiveTab('dashboard')}
+          >
+            {activeTab === 'dashboard' && (
             <DashboardOverview
               workspace={workspace}
               contacts={contacts}
@@ -3840,7 +3849,9 @@ export default function App() {
               onUpdatePrivateProfile={handleUpdatePrivateProfile}
               onAddMember={handleAddMember}
               onDeleteMember={handleDeleteMember}
-              onSendPasswordReset={triggerPasswordReset}
+              onSendPasswordReset={async (email) => {
+                await triggerPasswordReset(email);
+              }}
               onSendEmailVerification={async () => {
                 if (currentUser) await triggerEmailVerification(currentUser);
               }}
@@ -3871,6 +3882,7 @@ export default function App() {
               }}
             />
           )}
+          </ErrorBoundary>
         </main>
       </div>
 

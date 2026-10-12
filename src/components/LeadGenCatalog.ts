@@ -189,7 +189,13 @@ export type CanvasBlockType =
   | 'social_proof'
   | 'thank_you_card';
 
-export type PageVisualTheme = 'classic_ivory' | 'obsidian_gold' | 'emerald_executive';
+export type PageVisualTheme =
+  | 'classic_ivory'
+  | 'obsidian_gold'
+  | 'emerald_executive'
+  | 'classic_ivory_brass'
+  | 'obsidian_gold_editorial'
+  | 'executive_emerald';
 
 export interface FaqPairItem {
   question: string;
@@ -203,6 +209,7 @@ export interface CanvasBlockItem {
   content: string;
   items?: string[];
   accentNote?: string;
+  ctaButtonLabel?: string;
   // Video / VSL Player fields
   videoUrl?: string;
   videoDuration?: string;
@@ -211,11 +218,24 @@ export interface CanvasBlockItem {
   originalPrice?: string;
   billingCadence?: string;
   guaranteeNote?: string;
+  pricingTiers?: {
+    name: string;
+    price: string;
+    badge?: string;
+    billingPeriod?: string;
+    highlighted?: boolean;
+    features: string[];
+    ctaLabel: string;
+  }[];
   // Urgency Countdown Timer fields
   countdownDays?: number;
   countdownHours?: number;
   countdownMinutes?: number;
   countdownSeconds?: number;
+  timerHours?: string | number;
+  timerMinutes?: string | number;
+  timerSeconds?: string | number;
+  timerLabel?: string;
   // Interactive FAQ Accordion items
   faqItems?: FaqPairItem[];
 }
@@ -224,6 +244,7 @@ export interface ElementPaletteSpec {
   type: CanvasBlockType;
   label: string;
   shortLabel: string;
+  badge?: string;
   category: 'Core Layout' | 'Conversion & Media' | 'Offer & Proof' | 'Lead Capture';
   description: string;
 }
@@ -471,6 +492,7 @@ export interface ReadyMadePageTemplate {
   toolFormat: LeadGenToolFormat;
   visualTheme: PageVisualTheme;
   description: string;
+  summary?: string;
   defaultTitle: string;
   defaultSlug: string;
   defaultHeadline: string;

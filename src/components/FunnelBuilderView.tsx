@@ -113,7 +113,7 @@ export const FunnelBuilderView: React.FC<FunnelBuilderViewProps> = ({
 
   const [activeFunnelId, setActiveFunnelId] = useState<string>(funnels[0]?.id || '');
   const activeFunnel = useMemo(
-    () => funnels.find((f) => f.id === activeFunnelId) || funnels[0],
+    () => funnels.find((f) => f.id === activeFunnelId) || funnels[0] || INITIAL_CONVERSION_FUNNELS[0],
     [funnels, activeFunnelId]
   );
 
